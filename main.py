@@ -1,78 +1,83 @@
-import os
-import json
-import openai
+
 from fastapi import FastAPI, Request
-from fastapi.responses import JSONResponse
 import httpx
+import os
 from dotenv import load_dotenv
+import json
 
 load_dotenv()
 
 app = FastAPI()
 
-openai.api_key = os.getenv("OPENAI_API_KEY")
-TENANT_ACCESS_TOKEN = os.getenv("TENANT_ACCESS_TOKEN")
+LARK_APP_ID = os.getenv("APP_ID")
+LARK_APP_SECRET = os.getenv("APP_SECRET")
 VERIFICATION_TOKEN = os.getenv("VERIFICATION_TOKEN")
-
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 
 @app.post("/webhook")
 async def webhook(request: Request):
-    try:
-        body = await request.json()
-        print("Received body:", json.dumps(body))
+    payload = await request.json()
 
-        # Lark 驗證用
-        if body.get("type") == "url_verification":
-            if body.get("token") != VERIFICATION_TOKEN:
-                return JSONResponse(status_code=403, content={"error": "Invalid verification token"})
-            return {"challenge": body.get("challenge")}
+    # webhook 驗證階段
+    if "challenge" in payload:
+        return {"challenge": payload["challenge"]}
 
-        # 訊息事件處理
-        if body.get("header", {}).get("event_type") == "im.message.receive_v1":
-            message_content = json.loads(body["event"]["message"]["content"])
-            user_id = body["event"]["sender"]["sender_id"]["user_id"]
-            msg_type = body["event"]["message"]["message_type"]
-            chat_id = body["event"]["message"]["chat_id"]
+    # token 驗證
+    if payload.get("header", {}).get("token") != VERIFICATION_TOKEN:
+        return {"code": 1, "message": "Invalid token"}
 
-            if msg_type == "text":
-                user_message = message_content.get("text", "")
+    # 處理收到訊息
+    event_type = payload.get("header", {}).get("event_type")
+    if event_type == "im.message.receive_v1":
+        message = payload["event"]["message"]
+        chat_id = message["chat_id"]
+        text_raw = json.loads(message["content"]).get("text", "")
+        user_text = text_raw.replace('<at user_id=\"all\">所有人</at>', '').strip()
 
-                # 與 ChatGPT 溝通
-                try:
-                    gpt_reply = openai.ChatCompletion.create(
-                        model="gpt-3.5-turbo",
-                        messages=[
-                            {"role": "system", "content": "你是貼心的工作助理，請根據使用者指示回覆具體資訊。"},
-                            {"role": "user", "content": user_message}
-                        ]
-                    )
-                    reply_text = gpt_reply.choices[0].message.content
-                except Exception as e:
-                    reply_text = "很抱歉，目前無法提供服務，請稍後再試。"
-                    print("OpenAI 回覆錯誤:", e)
+        reply = await get_chatgpt_response(user_text)
+        await send_message_to_lark(chat_id, reply)
 
-                # 傳送回 Lark
-                try:
-                    headers = {
-                        "Authorization": f"Bearer {TENANT_ACCESS_TOKEN}",
-                        "Content-Type": "application/json"
-                    }
-                    payload = {
-                        "chat_id": chat_id,
-                        "msg_type": "text",
-                        "content": json.dumps({"text": reply_text})
-                    }
-                    async with httpx.AsyncClient() as client:
-                        res = await client.post(
-                            "https://open.larksuite.com/open-apis/im/v1/messages",
-                            headers=headers,
-                            json=payload
-                        )
-                        print("Lark 發送結果:", res.status_code, await res.aread())
-                except Exception as e:
-                    print("傳送訊息給 Lark 發生錯誤:", e)
+    return {"code": 0, "message": "ok"}
 
-        return {"code": 0, "msg": "OK"}
-    except Exception as e:
-        print("Webhook 處理錯誤:", e)
-        return JSONResponse(status_code=500, content={"error": str(e)})
+async def get_chatgpt_response(prompt: str) -> str:
+    async with httpx.AsyncClient() as client:
+        response = await client.post(
+            "https://api.openai.com/v1/chat/completions",
+            headers={
+                "Authorization": f"Bearer {OPENAI_API_KEY}",
+                "Content-Type": "application/json"
+            },
+            json={
+                "model": "gpt-4",
+                "messages": [{"role": "user", "content": prompt}]
+            }
+        )
+        result = response.json()
+        return result["choices"][0]["message"]["content"]
+
+async def get_lark_token() -> str:
+    async with httpx.AsyncClient() as client:
+        response = await client.post(
+            "https://open.larksuite.com/open-apis/auth/v3/tenant_access_token/internal",
+            json={
+                "app_id": LARK_APP_ID,
+                "app_secret": LARK_APP_SECRET
+            }
+        )
+        return response.json()["tenant_access_token"]
+
+async def send_message_to_lark(chat_id: str, text: str):
+    token = await get_lark_token()
+    async with httpx.AsyncClient() as client:
+        await client.post(
+            "https://open.larksuite.com/open-apis/im/v1/messages?receive_id_type=chat_id",
+            headers={
+                "Authorization": f"Bearer {token}",
+                "Content-Type": "application/json"
+            },
+            json={
+                "receive_id": chat_id,
+                "msg_type": "text",
+                "content": json.dumps({"text": text})
+            }
+        )
