@@ -17,7 +17,7 @@ OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 async def webhook(request: Request):
     payload = await request.json()
 
-    # ✅ 回應 Lark，避免 webhook timeout
+   
     response = {"code": 0, "message": "ok"}
 
     try:
@@ -31,7 +31,7 @@ async def webhook(request: Request):
             text_raw = message["content"]
             user_text = text_raw.replace('<at user_id="all">所有人</at>', '').strip()
 
-            # ✅ 非同步處理，不阻塞回應
+            
             asyncio.create_task(process_message(chat_id, user_text))
 
     except Exception as e:
