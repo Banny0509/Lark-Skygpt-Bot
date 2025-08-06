@@ -6,7 +6,6 @@ import re
 from fastapi import FastAPI, Request, HTTPException
 
 # --- 1. 日誌設定 ---
-# 這是您在伺服器上觀察機器人行為的眼睛，非常重要。
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
@@ -14,7 +13,6 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # --- 2. 智慧載入環境變數 ---
-# 判斷是否在 Railway 等生產環境，如果是，就直接用平台變數，否則才讀取本地 .env
 if "RAILWAY_ENVIRONMENT" not in os.environ:
     from dotenv import load_dotenv
     logger.info("偵測到非生產環境，正在載入 .env 檔案...")
@@ -32,12 +30,9 @@ VERIFICATION_TOKEN = os.getenv("VERIFICATION_TOKEN")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 
 if not all([LARK_APP_ID, LARK_APP_SECRET, VERIFICATION_TOKEN, OPENAI_API_KEY]):
-    logger.critical("一個或多個必要的環境變數未設定！應用程式無法啟動。")
-    # 如果希望在缺少金鑰時直接讓應用崩潰，可以取消下面這行的註解
-    # raise ValueError("一個或多個必要的環境變數未設定！")
+    logger.critical("一個或多個必要的環境變數未設定！")
 
 # --- 5. 健康檢查端點 ---
-# 這是提供給 Railway 平台的「心跳」，告訴它「我還活著」，避免被誤殺。
 @app.get("/health", status_code=200)
 async def health_check():
     return {"status": "ok"}
@@ -160,34 +155,23 @@ async def send_message_to_lark(chat_id: str, text: str):
     """
     向指定的 Lark 聊天發送文字訊息。
     """
+    logger.info(f"準備向 chat_id {chat_id} 發送訊息: '{text[:50]}...'")
     try:
         token = await get_lark_token()
-        
-        # --- 【關鍵修正】採用最標準、最不會出錯的發送方式 ---
-        
-        # 1. 準備好要發送的完整資料結構
-        payload_dict = {
-            "receive_id": chat_id,
-            "msg_type": "text",
-            "content": json.dumps({"text": text}) # 將 content 的值轉換成 JSON 字串
-        }
-        
-        # 2. 將整個資料結構轉換成一個最終的 JSON 字串
-        final_payload_str = json.dumps(payload_dict)
-        logger.info(f"準備向 Lark API 發送的最終資料: {final_payload_str}")
-
-        # 3. 設定好請求標頭
         headers = {
             "Authorization": f"Bearer {token}",
             "Content-Type": "application/json; charset=utf-8"
         }
-        
-        # 4. 使用 content= 參數發送原始的 JSON 字串資料
+        payload = {
+            "receive_id": chat_id,
+            "msg_type": "text",
+            "content": json.dumps({"text": text})
+        }
         async with httpx.AsyncClient() as client:
             response = await client.post(
                 "https://open.larksuite.com/open-apis/im/v1/messages?receive_id_type=chat_id",
                 headers=headers,
-                content=final_payload_str
+                json=payload
             )
             response.raise_for_status()
             result = response.json()
