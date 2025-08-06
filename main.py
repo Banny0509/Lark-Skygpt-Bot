@@ -1,25 +1,21 @@
 import httpx
 import os
+from dotenv import load_dotenv
 import json
 import logging
 from fastapi import FastAPI, Request, HTTPException
 
-# --- 1. 日誌設定 ---
+# --- 1. 日誌設定 (非常重要) ---
+# 設定日誌記錄，方便在 Railway 或其他平台上查看應用程式的運行狀況和錯誤。
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
 
-# --- 2. 【關鍵修正】智慧載入環境變數 ---
-# 判斷是否在生產環境 (例如 Railway)。如果是，就不執行 load_dotenv()。
-# 我們可以通過檢查 Railway 特有的環境變數來判斷。
-if "RAILWAY_ENVIRONMENT" not in os.environ:
-    from dotenv import load_dotenv
-    logger.info("偵測到非生產環境，正在載入 .env 檔案...")
-    load_dotenv()
-else:
-    logger.info("偵測到生產環境，將直接使用平台設定的環境變數。")
+# --- 2. 載入環境變數 ---
+# 從 .env 檔案或平台設定的環境變數中讀取敏感資訊。
+load_dotenv()
 
 # --- 3. 初始化 FastAPI 應用 ---
 app = FastAPI()
@@ -33,8 +29,8 @@ OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 # 檢查必要的環境變數是否都已設定
 if not all([LARK_APP_ID, LARK_APP_SECRET, VERIFICATION_TOKEN, OPENAI_API_KEY]):
     logger.critical("一個或多個必要的環境變數未設定！請檢查您的 .env 檔案或平台設定。")
-    # 這裡可以加上 raise Exception 來阻止應用啟動
-    # raise ValueError("關鍵環境變數未設定！")
+    # 在這種嚴重情況下，可以選擇讓應用程式無法啟動
+    # raise ValueError("一個或多個必要的環境變數未設定！")
 
 
 @app.post("/webhook")
@@ -49,15 +45,18 @@ async def webhook(request: Request):
         logger.error("收到了無效的 JSON 格式請求。")
         raise HTTPException(status_code=400, detail="無效的 JSON 格式。")
 
+    # --- Lark Webhook URL 驗證挑戰 ---
     if "challenge" in payload:
         logger.info("收到 URL 驗證挑戰，已成功回應。")
         return {"challenge": payload["challenge"]}
 
+    # --- 事件 Token 驗證 ---
     header = payload.get("header", {})
     if header.get("token") != VERIFICATION_TOKEN:
         logger.warning(f"收到了無效的 Token: {header.get('token')}")
         raise HTTPException(status_code=403, detail="無效的 Token。")
 
+    # --- 事件處理路由 ---
     event_type = header.get("event_type")
     if event_type == "im.message.receive_v1":
         try:
