@@ -4,9 +4,9 @@ import os
 from dotenv import load_dotenv
 import json
 import logging
+import uvicorn # 引入 uvicorn
 
-# --- 建議增加日誌紀錄，方便未來除錯 ---
-# --- It is recommended to add logging for future debugging ---
+# --- 日誌紀錄設定 ---
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
@@ -14,6 +14,7 @@ load_dotenv()
 
 app = FastAPI()
 
+# --- 從環境變數讀取設定 ---
 LARK_APP_ID = os.getenv("APP_ID")
 LARK_APP_SECRET = os.getenv("APP_SECRET")
 VERIFICATION_TOKEN = os.getenv("VERIFICATION_TOKEN")
@@ -22,11 +23,12 @@ OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 @app.post("/webhook")
 async def webhook(request: Request):
     """
+    處理來自 Lark (飛書) 平台的 Webhook 請求。
     Handles incoming webhooks from the Lark platform.
     """
     payload = await request.json()
 
-    # --- Webhook 驗證 ---
+    # --- Webhook 驗證挑戰 ---
     # --- Webhook verification challenge ---
     if "challenge" in payload:
         return {"challenge": payload["challenge"]}
@@ -46,8 +48,8 @@ async def webhook(request: Request):
             message = payload.get("event", {}).get("message", {})
             msg_type = message.get("message_type")
 
-            # 1.【修正】只處理文字 (text) 類型的訊息
-            # 1. [FIX] Only process messages of type "text"
+            # 只處理文字 (text) 類型的訊息
+            # Only process messages of type "text"
             if msg_type != "text":
                 logger.info(f"Ignoring non-text message type: {msg_type}")
                 return {"code": 0, "message": "ok"}
@@ -55,8 +57,8 @@ async def webhook(request: Request):
             chat_id = message.get("chat_id")
             content_str = message.get("content", "{}")
 
-            # 2.【修正】將 JSON 解析包在 try-except 中，並處理空內容
-            # 2. [FIX] Wrap JSON parsing in a try-except block and handle empty content
+            # 將 JSON 解析包在 try-except 中，並處理空內容
+            # Wrap JSON parsing in a try-except block and handle empty content
             content_dict = json.loads(content_str)
             text_raw = content_dict.get("text", "")
             
@@ -64,8 +66,8 @@ async def webhook(request: Request):
             # Clean up the @all tag and strip whitespace
             user_text = text_raw.replace('<at user_id=\"all\">所有人</at>', '').strip()
 
-            # 3.【修正】如果處理後訊息為空，則不呼叫 OpenAI
-            # 3. [FIX] If the message is empty after processing, do not call OpenAI
+            # 如果處理後訊息為空，則不呼叫 OpenAI
+            # If the message is empty after processing, do not call OpenAI
             if not user_text:
                 logger.info("Empty message after processing, ignoring.")
                 return {"code": 0, "message": "ok"}
@@ -92,6 +94,7 @@ async def webhook(request: Request):
 
 async def get_chatgpt_response(prompt: str) -> str:
     """
+    從 OpenAI ChatGPT API 獲取回應。
     Gets a response from the OpenAI ChatGPT API.
     """
     async with httpx.AsyncClient() as client:
@@ -106,21 +109,21 @@ async def get_chatgpt_response(prompt: str) -> str:
                     "model": "gpt-4",
                     "messages": [{"role": "user", "content": prompt}]
                 },
-                timeout=60 # 建議增加超時時間，避免 OpenAI 回應過久 (Recommended to add a timeout)
+                timeout=60
             )
-            response.raise_for_status() # 如果 API 回傳非 2xx 狀態碼，會拋出異常 (Raises an exception for non-2xx status codes)
+            response.raise_for_status()
             result = response.json()
-            return result.get("choices", [{}])[0].get("message", {}).get("content", "Sorry, I encountered an error.")
+            return result.get("choices", [{}])[0].get("message", {}).get("content", "抱歉，我遇到了一個錯誤。")
         except httpx.RequestError as e:
             logger.error(f"HTTP request to OpenAI failed: {e}")
-            return "Sorry, I couldn't connect to the AI service."
+            return "抱歉，我無法連接到 AI 服務。"
         except Exception as e:
             logger.error(f"An error occurred while getting ChatGPT response: {e}")
-            return "Sorry, an unexpected error occurred."
-
+            return "抱歉，發生了未預期的錯誤。"
 
 async def get_lark_token() -> str:
     """
+    從 Lark 獲取 tenant_access_token。
     Retrieves the tenant_access_token from Lark.
     """
     async with httpx.AsyncClient() as client:
@@ -136,6 +139,7 @@ async def get_lark_token() -> str:
 
 async def send_message_to_lark(chat_id: str, text: str):
     """
+    向指定的 Lark 聊天發送文字訊息。
     Sends a text message to a specified Lark chat.
     """
     try:
@@ -157,4 +161,15 @@ async def send_message_to_lark(chat_id: str, text: str):
             logger.info(f"Sent message to chat_id {chat_id}. Response: {response.json()}")
     except Exception as e:
         logger.error(f"Failed to send message to Lark: {e}")
+
+# --- 【關鍵修正】應用程式啟動點 ---
+# --- [CRITICAL FIX] Application entry point ---
+if __name__ == "__main__":
+    # Railway/Heroku 等平台會透過 PORT 環境變數提供端口號
+    # Platforms like Railway/Heroku provide the port number via the PORT environment variable.
+    port = int(os.getenv("PORT", 8080)) # 如果沒有 PORT 環境變數，則預設使用 8080
+
+    # 監聽 0.0.0.0 以便從容器外部可以訪問服務
+    # Listen on 0.0.0.0 to make the service accessible from outside the container.
+    uvicorn.run(app, host="0.0.0.0", port=port)
 
