@@ -183,3 +183,6 @@ async def send_message_to_lark(chat_id: str, text: str):
                 logger.error(f"發送 Lark 訊息失敗: Code={result.get('code')}, Msg={result.get('msg')}, RequestID: {response.headers.get('X-Request-Id')}")
     except Exception as e:
         logger.error(f"發送訊息到 Lark 時發生嚴重錯誤: {e}", exc_info=True)
+
+# 強制觸發一次新的部署 v1.0
+
