@@ -1,21 +1,23 @@
 import httpx
 import os
-from dotenv import load_dotenv
 import json
 import logging
 from fastapi import FastAPI, Request, HTTPException
 
-# --- 1. 日誌設定 (非常重要) ---
-# 設定日誌記錄，方便在 Railway 或其他平台上查看應用程式的運行狀況和錯誤。
+# --- 1. 日誌設定 ---
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
 
-# --- 2. 載入環境變數 ---
-# 從 .env 檔案或平台設定的環境變數中讀取敏感資訊。
-load_dotenv()
+# --- 2. 智慧載入環境變數 ---
+if "RAILWAY_ENVIRONMENT" not in os.environ:
+    from dotenv import load_dotenv
+    logger.info("偵測到非生產環境，正在載入 .env 檔案...")
+    load_dotenv()
+else:
+    logger.info("偵測到生產環境，將直接使用平台設定的環境變數。")
 
 # --- 3. 初始化 FastAPI 應用 ---
 app = FastAPI()
@@ -26,17 +28,24 @@ LARK_APP_SECRET = os.getenv("APP_SECRET")
 VERIFICATION_TOKEN = os.getenv("VERIFICATION_TOKEN")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 
-# 檢查必要的環境變數是否都已設定
 if not all([LARK_APP_ID, LARK_APP_SECRET, VERIFICATION_TOKEN, OPENAI_API_KEY]):
-    logger.critical("一個或多個必要的環境變數未設定！請檢查您的 .env 檔案或平台設定。")
-    # 在這種嚴重情況下，可以選擇讓應用程式無法啟動
-    # raise ValueError("一個或多個必要的環境變數未設定！")
+    logger.critical("一個或多個必要的環境變數未設定！")
+
+# --- 【關鍵修正】加入健康檢查端點 ---
+@app.get("/health", status_code=200)
+async def health_check():
+    """
+    提供給 Railway 平台的健康檢查端點。
+    當平台訪問這個 URL 時，會收到一個成功的 200 OK 回應，
+    這會告訴平台我們的應用程式正在正常運行。
+    """
+    return {"status": "ok"}
 
 
 @app.post("/webhook")
 async def webhook(request: Request):
     """
-    接收並處理來自 Lark (飛書) 開放平台的 Webhook 事件。
+    接收並處理來自 Lark 的 Webhook 事件。
     """
     payload_bytes = await request.body()
     try:
@@ -45,18 +54,15 @@ async def webhook(request: Request):
         logger.error("收到了無效的 JSON 格式請求。")
         raise HTTPException(status_code=400, detail="無效的 JSON 格式。")
 
-    # --- Lark Webhook URL 驗證挑戰 ---
     if "challenge" in payload:
         logger.info("收到 URL 驗證挑戰，已成功回應。")
         return {"challenge": payload["challenge"]}
 
-    # --- 事件 Token 驗證 ---
     header = payload.get("header", {})
     if header.get("token") != VERIFICATION_TOKEN:
         logger.warning(f"收到了無效的 Token: {header.get('token')}")
         raise HTTPException(status_code=403, detail="無效的 Token。")
 
-    # --- 事件處理路由 ---
     event_type = header.get("event_type")
     if event_type == "im.message.receive_v1":
         try:
@@ -184,4 +190,3 @@ async def send_message_to_lark(chat_id: str, text: str):
                 logger.error(f"發送 Lark 訊息失敗: Code={result.get('code')}, Msg={result.get('msg')}")
     except Exception as e:
         logger.error(f"發送訊息到 Lark 時發生嚴重錯誤: {e}", exc_info=True)
-
