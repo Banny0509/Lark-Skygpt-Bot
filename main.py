@@ -40,9 +40,6 @@ async def health_check():
 
 @app.post("/webhook")
 async def webhook(request: Request):
-    """
-    接收並處理來自 Lark 的所有 Webhook 事件。
-    """
     payload_bytes = await request.body()
     try:
         payload = json.loads(payload_bytes)
@@ -72,9 +69,6 @@ async def webhook(request: Request):
 
 
 async def handle_message_receive(event: dict):
-    """
-    專門處理「接收訊息」事件。
-    """
     message = event.get("message", {})
     if not message:
         return
@@ -111,9 +105,6 @@ async def handle_message_receive(event: dict):
 
 
 async def get_chatgpt_response(prompt: str) -> str:
-    """
-    向 OpenAI API 發送請求並獲取回應。
-    """
     logger.info(f"向 OpenAI 發送請求: '{prompt[:50]}...'")
     async with httpx.AsyncClient() as client:
         response = await client.post(
@@ -135,9 +126,6 @@ async def get_chatgpt_response(prompt: str) -> str:
 
 
 async def get_lark_token() -> str:
-    """
-    獲取 Lark 應用所需的 tenant_access_token。
-    """
     async with httpx.AsyncClient() as client:
         response = await client.post(
             "https://open.larksuite.com/open-apis/auth/v3/tenant_access_token/internal",
@@ -152,9 +140,6 @@ async def get_lark_token() -> str:
 
 
 async def send_message_to_lark(chat_id: str, text: str):
-    """
-    向指定的 Lark 聊天發送文字訊息。
-    """
     logger.info(f"準備向 chat_id {chat_id} 發送訊息: '{text[:50]}...'")
     try:
         token = await get_lark_token()
@@ -181,4 +166,3 @@ async def send_message_to_lark(chat_id: str, text: str):
                 logger.error(f"發送 Lark 訊息失敗: Code={result.get('code')}, Msg={result.get('msg')}, RequestID: {response.headers.get('X-Request-Id')}")
     except Exception as e:
         logger.error(f"發送訊息到 Lark 時發生嚴重錯誤: {e}", exc_info=True)
-
