@@ -2,7 +2,7 @@ import httpx
 import os
 import json
 import logging
-import re  # 引入正則表達式模組
+import re
 from fastapi import FastAPI, Request, HTTPException
 
 # --- 1. 日誌設定 ---
@@ -25,16 +25,15 @@ else:
 # --- 3. 初始化 FastAPI 應用 ---
 app = FastAPI()
 
-# --- 4. 讀取設定值 ---
+# --- 4. 讀取並驗證設定值 ---
 LARK_APP_ID = os.getenv("APP_ID")
 LARK_APP_SECRET = os.getenv("APP_SECRET")
 VERIFICATION_TOKEN = os.getenv("VERIFICATION_TOKEN")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 
-# 啟動時檢查，確保所有金鑰都已設定
 if not all([LARK_APP_ID, LARK_APP_SECRET, VERIFICATION_TOKEN, OPENAI_API_KEY]):
     logger.critical("一個或多個必要的環境變數未設定！應用程式無法啟動。")
-    # 如果您希望在缺少金鑰時直接讓應用崩潰，可以取消下面這行的註解
+    # 如果希望在缺少金鑰時直接讓應用崩潰，可以取消下面這行的註解
     # raise ValueError("一個或多個必要的環境變數未設定！")
 
 # --- 5. 健康檢查端點 ---
@@ -56,18 +55,15 @@ async def webhook(request: Request):
         logger.error("收到了無效的 JSON 格式請求。")
         raise HTTPException(status_code=400, detail="無效的 JSON 格式。")
 
-    # 處理 Lark 的 URL 驗證挑戰
     if "challenge" in payload:
         logger.info("收到 URL 驗證挑戰，已成功回應。")
         return {"challenge": payload["challenge"]}
 
-    # 驗證事件來源是否為我們的 Lark 應用
     header = payload.get("header", {})
     if header.get("token") != VERIFICATION_TOKEN:
         logger.warning(f"收到了無效的 Token: {header.get('token')}")
         raise HTTPException(status_code=403, detail="無效的 Token。")
 
-    # 根據事件類型，交給對應的函式處理
     event_type = header.get("event_type")
     if event_type == "im.message.receive_v1":
         try:
@@ -77,7 +73,6 @@ async def webhook(request: Request):
     else:
         logger.info(f"收到了暫不處理的事件類型: {event_type}")
 
-    # 向 Lark 回應成功，避免它重複發送同一個事件
     return {"code": 0}
 
 
@@ -92,12 +87,10 @@ async def handle_message_receive(event: dict):
     message_type = message.get("message_type")
     chat_id = message.get("chat_id")
     
-    # 我們只處理文字訊息
     if message_type != "text":
         logger.info(f"忽略非文字訊息 (類型: {message_type})。")
         return
 
-    # 解析 Lark 傳來的 content JSON 字串
     try:
         content_str = message.get("content", "{}")
         content_dict = json.loads(content_str)
@@ -106,10 +99,8 @@ async def handle_message_receive(event: dict):
         logger.error(f"解析訊息 content 失敗, 原始 content: {message.get('content')}")
         return
 
-    # 使用正則表達式，穩定地移除所有 @提及 標籤
     user_text = re.sub(r'<at.*?</at>', '', text_from_lark).strip()
 
-    # 如果只 @機器人 而沒有其他文字，則忽略
     if not user_text:
         logger.info("移除 @提及 後訊息為空，已忽略。")
         return
@@ -121,7 +112,6 @@ async def handle_message_receive(event: dict):
         await send_message_to_lark(chat_id, chatgpt_reply)
     except Exception as e:
         logger.error(f"與外部 API 互動時出錯: {e}", exc_info=True)
-        # 通知使用者發生錯誤
         await send_message_to_lark(chat_id, "抱歉，我現在遇到一點問題，請稍後再試。")
 
 
@@ -140,7 +130,7 @@ async def get_chatgpt_response(prompt: str) -> str:
             json={"model": "gpt-4", "messages": [{"role": "user", "content": prompt}]},
             timeout=120
         )
-        response.raise_for_status() # 確保請求成功
+        response.raise_for_status()
         result = response.json()
         reply_text = result.get("choices", [{}])[0].get("message", {}).get("content", "")
         if not reply_text:
@@ -170,31 +160,41 @@ async def send_message_to_lark(chat_id: str, text: str):
     """
     向指定的 Lark 聊天發送文字訊息。
     """
-    logger.info(f"準備向 chat_id {chat_id} 發送訊息: '{text[:50]}...'")
     try:
         token = await get_lark_token()
+        
+        # --- 【關鍵修正】採用最標準、最不會出錯的發送方式 ---
+        
+        # 1. 準備好要發送的完整資料結構
+        payload_dict = {
+            "receive_id": chat_id,
+            "msg_type": "text",
+            "content": json.dumps({"text": text}) # 將 content 的值轉換成 JSON 字串
+        }
+        
+        # 2. 將整個資料結構轉換成一個最終的 JSON 字串
+        final_payload_str = json.dumps(payload_dict)
+        logger.info(f"準備向 Lark API 發送的最終資料: {final_payload_str}")
+
+        # 3. 設定好請求標頭
         headers = {
             "Authorization": f"Bearer {token}",
             "Content-Type": "application/json; charset=utf-8"
         }
-        # --- 【關鍵修正】content 欄位必須是一個 JSON 字串 ---
-        payload = {
-            "receive_id": chat_id,
-            "msg_type": "text",
-            "content": json.dumps({"text": text})
-        }
+        
+        # 4. 使用 content= 參數發送原始的 JSON 字串資料
         async with httpx.AsyncClient() as client:
             response = await client.post(
                 "https://open.larksuite.com/open-apis/im/v1/messages?receive_id_type=chat_id",
                 headers=headers,
-                json=payload
+                content=final_payload_str
             )
             response.raise_for_status()
             result = response.json()
             if result.get("code") == 0:
                 logger.info("訊息已成功發送到 Lark。")
             else:
-                logger.error(f"發送 Lark 訊息失敗: Code={result.get('code')}, Msg={result.get('msg')}")
+                logger.error(f"發送 Lark 訊息失敗: Code={result.get('code')}, Msg={result.get('msg')}, RequestID: {response.headers.get('X-Request-Id')}")
     except Exception as e:
         logger.error(f"發送訊息到 Lark 時發生嚴重錯誤: {e}", exc_info=True)
 
