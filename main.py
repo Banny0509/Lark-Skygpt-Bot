@@ -5,7 +5,7 @@ import logging
 import re
 from fastapi import FastAPI, Request, HTTPException
 
-# --- 1. 日誌設定 ---
+# --- 1. 日誌設定 ---# 強制觸發一次新的部署 v1.0
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
@@ -184,5 +184,5 @@ async def send_message_to_lark(chat_id: str, text: str):
     except Exception as e:
         logger.error(f"發送訊息到 Lark 時發生嚴重錯誤: {e}", exc_info=True)
 
-# 強制觸發一次新的部署 v1.0
+
 
