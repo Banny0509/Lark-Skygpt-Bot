@@ -97,45 +97,33 @@ def get_current_time_and_date(timezone_offset: int = 8) -> str:
 
 async def handle_message_receive(event: dict):
     """
-    專門處理「接收訊息」事件，並整合了「場景判斷」、「條件觸發」和「工具使用」的邏輯。
+    專門處理「接收訊息」事件，並整合了「條件觸發」和「工具使用」的邏輯。
     """
     message = event.get("message", {})
     if not message:
         return
 
-    chat_type = message.get("chat_type")
-    
-    # --- 【關鍵修正】判斷聊天類型 ---
-    if chat_type == "group":
-        # 如果是群聊，必須要 @機器人
-        mentions = message.get("mentions")
-        if not mentions:
-            logger.info("群聊中沒有提及任何人，已忽略。")
-            return
-
-        is_bot_mentioned = False
-        for mention in mentions:
-            mentioned_id = mention.get("id", {}).get("user_id")
-            if mentioned_id == LARK_APP_ID:
-                is_bot_mentioned = True
-                break
-
-        if not is_bot_mentioned:
-            logger.info("群聊中機器人未被提及，已忽略。")
-            return
-        
-        logger.info("偵測到機器人在群聊中被提及，開始處理訊息...")
-
-    elif chat_type == "p2p":
-        # 如果是私聊，直接處理
-        logger.info("偵測到私聊訊息，開始處理...")
-    
-    else:
-        # 其他聊天類型暫不處理
-        logger.info(f"收到未處理的聊天類型: {chat_type}，已忽略。")
+    # --- 1. 【條件觸發】檢查機器人是否被提及 ---
+    mentions = message.get("mentions")
+    if not mentions:
+        logger.info("訊息中沒有提及任何人，已忽略。")
         return
 
-    # --- 後續處理邏輯 ---
+    is_bot_mentioned = False
+    for mention in mentions:
+        # 在 Lark 中，機器人的 user_id 就是它的 App ID
+        mentioned_id = mention.get("id", {}).get("user_id")
+        if mentioned_id == LARK_APP_ID:
+            is_bot_mentioned = True
+            break
+
+    if not is_bot_mentioned:
+        logger.info("機器人未被提及，已忽略。")
+        return
+    
+    # --- 只有在機器人被提及時，才繼續執行後續邏輯 ---
+    logger.info("偵測到機器人被提及，開始處理訊息...")
+    
     chat_id = message.get("chat_id")
     message_type = message.get("message_type")
     
@@ -159,6 +147,7 @@ async def handle_message_receive(event: dict):
     logger.info(f"收到來自 {chat_id} 的有效問題: '{user_text}'")
 
     try:
+        # --- 2. 【工具使用】與 AI 的多輪對話循環 ---
         messages = [
             {"role": "system", "content": "你是一個名叫『Lark-Skygpt-Bot』的專業 AI 助手。你的知識截止於 2023 年，所以任何關於即時資訊（例如今天日期、現在時間）的問題，你都必須使用 `get_current_time_and_date` 工具來查詢。在回答問題時，請務必簡潔、專業。"},
             {"role": "user", "content": user_text}
