@@ -3,3 +3,4 @@ uvicorn
 python-dotenv
 httpx
 gunicorn
+lark-oapi
