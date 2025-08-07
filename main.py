@@ -4,6 +4,8 @@ import json
 import logging
 import re
 from fastapi import FastAPI, Request, HTTPException
+# 引入日期和時間工具
+from datetime import datetime, timezone, timedelta
 
 # --- 1. 日誌設定 ---
 logging.basicConfig(
@@ -48,96 +50,171 @@ async def webhook(request: Request):
         raise HTTPException(status_code=400, detail="無效的 JSON 格式。")
 
     if "challenge" in payload:
-        logger.info("收到 URL 驗證挑戰，已成功回應。")
         return {"challenge": payload["challenge"]}
 
     header = payload.get("header", {})
     if header.get("token") != VERIFICATION_TOKEN:
-        logger.warning(f"收到了無效的 Token: {header.get('token')}")
         raise HTTPException(status_code=403, detail="無效的 Token。")
 
     event_type = header.get("event_type")
     if event_type == "im.message.receive_v1":
-        try:
-            await handle_message_receive(payload.get("event", {}))
-        except Exception as e:
-            logger.error(f"處理訊息時發生未預期錯誤: {e}", exc_info=True)
-    else:
-        logger.info(f"收到了暫不處理的事件類型: {event_type}")
+        await handle_message_receive(payload.get("event", {}))
 
     return {"code": 0}
 
+# --- 定義我們的「工具箱」 ---
+tools = [
+    {
+        "type": "function",
+        "function": {
+            "name": "get_current_time_and_date",
+            "description": "當使用者詢問任何關於『今天』、『現在』的日期、時間或星期幾時，使用此工具。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "timezone_offset": {
+                        "type": "integer",
+                        "description": "時區偏移量，以小時為單位。例如，北京時間 (UTC+8) 請輸入 8。",
+                        "default": 8
+                    },
+                },
+            },
+        }
+    }
+]
+
+# --- 我們的工具函式 ---
+def get_current_time_and_date(timezone_offset: int = 8) -> str:
+    """獲取指定時區的當前日期和時間。"""
+    try:
+        tz = timezone(timedelta(hours=timezone_offset))
+        now = datetime.now(tz)
+        return now.strftime(f"好的，目前時間是 %Y年%m月%d日 星期%A %H:%M:%S (UTC+{timezone_offset})。")
+    except Exception as e:
+        logger.error(f"獲取時間時發生錯誤: {e}")
+        return "抱歉，我無法獲取當前的時間。"
+
 
 async def handle_message_receive(event: dict):
+    """
+    專門處理「接收訊息」事件，並整合了「條件觸發」和「工具使用」的邏輯。
+    """
     message = event.get("message", {})
     if not message:
         return
 
-    message_type = message.get("message_type")
+    # --- 1. 【條件觸發】檢查機器人是否被提及 ---
+    mentions = message.get("mentions")
+    if not mentions:
+        logger.info("訊息中沒有提及任何人，已忽略。")
+        return
+
+    is_bot_mentioned = False
+    for mention in mentions:
+        # 在 Lark 中，機器人的 user_id 就是它的 App ID
+        mentioned_id = mention.get("id", {}).get("user_id")
+        if mentioned_id == LARK_APP_ID:
+            is_bot_mentioned = True
+            break
+
+    if not is_bot_mentioned:
+        logger.info("機器人未被提及，已忽略。")
+        return
+    
+    # --- 只有在機器人被提及時，才繼續執行後續邏輯 ---
+    logger.info("偵測到機器人被提及，開始處理訊息...")
+    
     chat_id = message.get("chat_id")
+    message_type = message.get("message_type")
     
     if message_type != "text":
-        logger.info(f"忽略非文字訊息 (類型: {message_type})。")
+        logger.info(f"訊息非文字類型，已忽略。")
         return
 
     try:
         content_str = message.get("content", "{}")
         content_dict = json.loads(content_str)
         text_from_lark = content_dict.get("text", "")
-    except Exception:
-        logger.error(f"解析訊息 content 失敗, 原始 content: {message.get('content')}")
+    except Exception as e:
+        logger.error(f"解析訊息 content 失敗: {e}")
         return
 
     user_text = re.sub(r'<at.*?</at>', '', text_from_lark).strip()
-
     if not user_text:
         logger.info("移除 @提及 後訊息為空，已忽略。")
         return
 
-    logger.info(f"從 chat_id {chat_id} 收到有效問題: '{user_text}'")
+    logger.info(f"收到來自 {chat_id} 的有效問題: '{user_text}'")
 
     try:
-        chatgpt_reply = await get_chatgpt_response(user_text)
-        await send_message_to_lark(chat_id, chatgpt_reply)
-    except Exception as e:
-        logger.error(f"與外部 API 互動時出錯: {e}", exc_info=True)
-        await send_message_to_lark(chat_id, "抱歉，我現在遇到一點問題，請稍後再試。")
-
-
-async def get_chatgpt_response(prompt: str) -> str:
-    logger.info("--- 正在呼叫 OpenAI API ---")
-    try:
-        # 【優化】加入系統提示，讓 AI 回答更簡潔、專業
+        # --- 2. 【工具使用】與 AI 的多輪對話循環 ---
         messages = [
-            {"role": "system", "content": "你是一個名叫『Lark-Skygpt-Bot』的專業 AI 助手。請直接、簡潔地回答使用者的問題，不要任何多餘的客套話或開場白。"},
-            {"role": "user", "content": prompt}
+            {"role": "system", "content": "你是一個名叫『Lark-Skygpt-Bot』的專業 AI 助手。你的知識截止於 2023 年，所以任何關於即時資訊（例如今天日期、現在時間）的問題，你都必須使用 `get_current_time_and_date` 工具來查詢。在回答問題時，請務必簡潔、專業。"},
+            {"role": "user", "content": user_text}
         ]
-        async with httpx.AsyncClient() as client:
-            response = await client.post(
-                "https://api.openai.com/v1/chat/completions",
-                headers={
-                    "Authorization": f"Bearer {OPENAI_API_KEY}",
-                    "Content-Type": "application/json"
-                },
-                json={"model": "gpt-4", "messages": messages},
-                timeout=120
-            )
-            response.raise_for_status()
-            result = response.json()
-            reply_text = result.get("choices", [{}])[0].get("message", {}).get("content", "")
-            if not reply_text:
-                logger.warning("OpenAI 返回了空的回應。")
-                return "抱歉，我思考了一下，但沒有找到答案。"
-            return reply_text
-    except httpx.HTTPStatusError as e:
-        logger.error(f"OpenAI API 請求失敗，狀態碼: {e.response.status_code}, 回應: {e.response.text}")
-        raise Exception("OpenAI API 請求失敗。")
+
+        response_json = await call_openai_api(messages, tools)
+        response_message = response_json["choices"][0]["message"]
+
+        if response_message.get("tool_calls"):
+            logger.info("AI 決定使用工具...")
+            messages.append(response_message)
+            
+            tool_call = response_message["tool_calls"][0]
+            function_name = tool_call["function"]["name"]
+            
+            if function_name == "get_current_time_and_date":
+                function_response = get_current_time_and_date()
+                messages.append({
+                    "tool_call_id": tool_call["id"],
+                    "role": "tool",
+                    "name": function_name,
+                    "content": function_response,
+                })
+
+                logger.info("將工具結果送回 AI 進行總結...")
+                final_response_json = await call_openai_api(messages)
+                final_answer = final_response_json["choices"][0]["message"]["content"]
+            else:
+                final_answer = "抱歉，我不知道如何使用這個工具。"
+        else:
+            logger.info("AI 決定不使用工具，直接回答。")
+            final_answer = response_message["content"]
+
+        await send_message_to_lark(chat_id, final_answer)
+
     except Exception as e:
-        logger.error(f"呼叫 OpenAI API 時發生未預期錯誤: {e}", exc_info=True)
-        raise e
+        logger.error(f"處理訊息時發生最上層錯誤: {e}", exc_info=True)
+        await send_message_to_lark(chat_id, "抱歉，處理您的請求時發生了未預期的錯誤。")
+
+
+async def call_openai_api(messages, tools=None):
+    """一個專門用來呼叫 OpenAI API 的函式。"""
+    headers = {
+        "Authorization": f"Bearer {OPENAI_API_KEY}",
+        "Content-Type": "application/json"
+    }
+    json_data = {
+        "model": "gpt-4-turbo",
+        "messages": messages
+    }
+    if tools:
+        json_data["tools"] = tools
+        json_data["tool_choice"] = "auto"
+
+    async with httpx.AsyncClient() as client:
+        response = await client.post(
+            "https://api.openai.com/v1/chat/completions",
+            headers=headers,
+            json=json_data,
+            timeout=120
+        )
+        response.raise_for_status()
+        return response.json()
 
 
 async def get_lark_token() -> str:
+    # ... 此函式內容與之前相同 ...
     async with httpx.AsyncClient() as client:
         response = await client.post(
             "https://open.larksuite.com/open-apis/auth/v3/tenant_access_token/internal",
@@ -150,8 +227,8 @@ async def get_lark_token() -> str:
             raise Exception(f"獲取 Lark Token 失敗，回應: {data}")
         return token
 
-
 async def send_message_to_lark(chat_id: str, text: str):
+    # ... 此函式內容與之前相同 ...
     try:
         token = await get_lark_token()
         headers = {
@@ -174,6 +251,6 @@ async def send_message_to_lark(chat_id: str, text: str):
             if result.get("code") == 0:
                 logger.info("訊息已成功發送到 Lark。")
             else:
-                logger.error(f"發送 Lark 訊息失敗: Code={result.get('code')}, Msg={result.get('msg')}, RequestID: {response.headers.get('X-Request-Id')}")
+                logger.error(f"發送 Lark 訊息失敗: {result}")
     except Exception as e:
         logger.error(f"發送訊息到 Lark 時發生嚴重錯誤: {e}", exc_info=True)
