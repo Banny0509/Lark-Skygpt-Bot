@@ -95,36 +95,42 @@ def get_current_time_and_date(timezone_offset: int = 8) -> str:
         return "抱歉，我無法獲取當前的時間。"
 
 
+# =================================================================
+# vvvvvvvvvvvvvv     這裡是被修改的核心函式     vvvvvvvvvvvvvvvv
+# =================================================================
 async def handle_message_receive(event: dict):
     """
     專門處理「接收訊息」事件，並整合了「條件觸發」和「工具使用」的邏輯。
+    (新版：支援私人聊天和群組提及)
     """
     message = event.get("message", {})
     if not message:
         return
 
-    # --- 1. 【條件觸發】檢查機器人是否被提及 ---
-    mentions = message.get("mentions")
-    if not mentions:
-        logger.info("訊息中沒有提及任何人，已忽略。")
-        return
-
-    is_bot_mentioned = False
-    for mention in mentions:
-        # 在 Lark 中，機器人的 user_id 就是它的 App ID
-        mentioned_id = mention.get("id", {}).get("user_id")
-        if mentioned_id == LARK_APP_ID:
-            is_bot_mentioned = True
-            break
-
-    if not is_bot_mentioned:
-        logger.info("機器人未被提及，已忽略。")
-        return
-    
-    # --- 只有在機器人被提及時，才繼續執行後續邏輯 ---
-    logger.info("偵測到機器人被提及，開始處理訊息...")
-    
+    chat_type = message.get("chat_type")
     chat_id = message.get("chat_id")
+
+    # --- 1. 【條件觸發】檢查機器人是否被提及 或 是否為私人聊天 ---
+    is_trigger_condition_met = False
+    if chat_type == "p2p":
+        is_trigger_condition_met = True # 私人聊天直接觸發
+        logger.info("偵測到私人聊天，將直接處理。")
+    elif chat_type == "group":
+        mentions = message.get("mentions")
+        if mentions:
+            for mention in mentions:
+                mentioned_id = mention.get("id", {}).get("user_id")
+                if mentioned_id == LARK_APP_ID:
+                    is_trigger_condition_met = True
+                    break
+    
+    if not is_trigger_condition_met:
+        logger.info(f"位於群組 ({chat_id}) 的訊息未提及機器人，或是不支援的聊天類型，已忽略。")
+        return
+
+    # --- 只有在條件滿足時，才繼續執行後續邏輯 ---
+    logger.info("觸發條件滿足，開始處理訊息...")
+    
     message_type = message.get("message_type")
     
     if message_type != "text":
@@ -139,6 +145,7 @@ async def handle_message_receive(event: dict):
         logger.error(f"解析訊息 content 失敗: {e}")
         return
 
+    # 在群組聊天中，移除 @提及 標籤，對私人聊天無影響
     user_text = re.sub(r'<at.*?</at>', '', text_from_lark).strip()
     if not user_text:
         logger.info("移除 @提及 後訊息為空，已忽略。")
@@ -187,6 +194,10 @@ async def handle_message_receive(event: dict):
         logger.error(f"處理訊息時發生最上層錯誤: {e}", exc_info=True)
         await send_message_to_lark(chat_id, "抱歉，處理您的請求時發生了未預期的錯誤。")
 
+# =================================================================
+# ^^^^^^^^^^^^^^^^     這裡是被修改的核心函式     ^^^^^^^^^^^^^^^^
+# =================================================================
+
 
 async def call_openai_api(messages, tools=None):
     """一個專門用來呼叫 OpenAI API 的函式。"""
@@ -214,7 +225,7 @@ async def call_openai_api(messages, tools=None):
 
 
 async def get_lark_token() -> str:
-    # ... 此函式內容與之前相同 ...
+    """獲取 tenant_access_token"""
     async with httpx.AsyncClient() as client:
         response = await client.post(
             "https://open.larksuite.com/open-apis/auth/v3/tenant_access_token/internal",
@@ -228,7 +239,7 @@ async def get_lark_token() -> str:
         return token
 
 async def send_message_to_lark(chat_id: str, text: str):
-    # ... 此函式內容與之前相同 ...
+    """發送文字訊息到指定的 chat_id"""
     try:
         token = await get_lark_token()
         headers = {
