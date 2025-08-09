@@ -8,7 +8,7 @@ import re
 import base64
 from io import BytesIO
 from datetime import datetime, timezone, timedelta
-from typing import Optional, Dict, List
+from typing import Optional, Dict, List, Tuple, Any
 from collections import defaultdict
 import asyncio
 from sys import exit as sys_exit # 用於啟動失敗時退出
@@ -62,6 +62,13 @@ OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o")
 TIMEZONE_OFFSET = int(os.getenv("TIMEZONE_OFFSET", "8"))  # Asia/Taipei UTC+8 by default
 DATABASE_FILE = os.getenv("DATABASE_FILE", "lark_chat_history.db")  # 資料庫檔名
+
+# [IMAGE/FORWARD] Cache for the most recent media (image or file) in each chat.  
+# Keyed by chat_id. Each value is a dict storing type ("image" or "file"),
+# key (image_key or file_key), optional file_name, message_id, and timestamp (datetime).
+LAST_MEDIA_CACHE: Dict[str, Dict[str, Any]] = {}
+# TTL for cached media in seconds. If user asks a question within this window, we attach the last media.
+MEDIA_CACHE_TTL = 180  # 3 minutes
 
 # Name used to mention the bot in group chats. This should match the display name of your bot
 # in Lark (e.g., "Skygpt"). The name is case-insensitive and whitespace trimmed.
@@ -190,6 +197,14 @@ async def download_message_resource(message_id: str, file_key: str) -> bytes:
     url = f"https://open.larksuite.com/open-apis/im/v1/messages/{message_id}/resources/{file_key}"
     headers = {"Authorization": f"Bearer {token}"}
     r = await http_client.get(url, headers=headers)
+    # On certain tenants, images cannot be downloaded via the generic resource endpoint. In that case,
+    # fall back to the dedicated image endpoint using the file_key as image_key.
+    if r.status_code == 404 or r.status_code == 403:
+        # Try image endpoint (note: some tenants require image_type param; default works for origin)
+        fallback_url = f"https://open.larksuite.com/open-apis/im/v1/images/{file_key}"
+        r2 = await http_client.get(fallback_url, headers=headers)
+        r2.raise_for_status()
+        return r2.content
     r.raise_for_status()
     return r.content
 
@@ -359,6 +374,31 @@ async def handle_message_receive(event: dict):
     if all([message_id, chat_id, chat_type, summary_text]):
         await log_message_to_db(message_id, chat_id, chat_type, ts_local, summary_text)
 
+    # 更新媒體快取：記錄該聊天室最近的圖片或檔案（3分鐘內有效）
+    try:
+        if msg_type == "image":
+            image_key = content.get("image_key")
+            if image_key:
+                LAST_MEDIA_CACHE[chat_id] = {
+                    "type": "image",
+                    "key": image_key,
+                    "message_id": message_id,
+                    "timestamp": ts_local,
+                }
+        elif msg_type == "file":
+            file_key = content.get("file_key")
+            file_name = content.get("file_name") or ""
+            if file_key:
+                LAST_MEDIA_CACHE[chat_id] = {
+                    "type": "file",
+                    "key": file_key,
+                    "name": file_name,
+                    "message_id": message_id,
+                    "timestamp": ts_local,
+                }
+    except Exception as e:
+        logger.exception("Error updating media cache: %s", e)
+
     # 觸發條件
     is_trigger = (chat_type == "p2p") or (chat_type == "group" and _is_bot_mentioned_in_group(message))
     if not is_trigger:
@@ -403,7 +443,33 @@ async def handle_message_receive(event: dict):
             if not user_text:
                 await send_message_to_lark(chat_id, "（空白訊息）")
                 return
-            mm = [system_datetime_message(), {"role": "user", "content": user_text}]
+            # 檢查最近快取的圖片/檔案，若在有效時間內則附帶處理
+            last_media = LAST_MEDIA_CACHE.get(chat_id)
+            mm = [system_datetime_message()]
+            attached = False
+            if last_media:
+                try:
+                    age = (ts_local - last_media.get("timestamp", ts_local)).total_seconds()
+                    if age <= MEDIA_CACHE_TTL:
+                        if last_media.get("type") == "image":
+                            # 讀取並附上上一張圖片內容
+                            file_bytes = await download_message_resource(last_media["message_id"], last_media["key"])
+                            b64 = base64.b64encode(file_bytes).decode("utf-8")
+                            mm.append({"role": "user", "content": build_image_content(b64)})
+                            attached = True
+                        elif last_media.get("type") == "file":
+                            # 讀取並附上上一個檔案內容
+                            file_bytes = await download_message_resource(last_media["message_id"], last_media["key"])
+                            extracted = extract_text_from_file(file_bytes, last_media.get("name") or "")
+                            # 附檔案內容前幾萬字，避免過長
+                            mm.append({"role": "user", "content": f"以下是近期附件內容：\n{extracted[:15000]}"})
+                            attached = True
+                except Exception as e:
+                    logger.exception("Failed to fetch cached media: %s", e)
+                    # 移除快取以避免下次重複失敗
+                    LAST_MEDIA_CACHE.pop(chat_id, None)
+            # 最後加入使用者的問題文字
+            mm.append({"role": "user", "content": user_text})
             resp = await call_openai_api(mm)
             reply = resp["choices"][0]["message"]["content"].strip()
         else:
