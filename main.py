@@ -192,21 +192,50 @@ async def send_message_to_lark(chat_id: str, text: str) -> None:
     except Exception:
         logger.error("send_message_to_lark failed: %s", r.text)
 
-async def download_message_resource(message_id: str, file_key: str) -> bytes:
+async def download_image(image_key: str) -> bytes:
+    """Download an image using the dedicated image endpoint. Images uploaded by users
+    can only be downloaded via this endpoint; attempting to fetch them via the
+    generic resource endpoint will return a 400/403 error. The caller must pass
+    a valid image_key obtained from the message content.
+
+    Args:
+        image_key: The image_key field from the message content.
+
+    Returns:
+        Raw bytes of the image. Raises httpx.HTTPError if the download fails.
+    """
     if not http_client:
         raise RuntimeError("HTTP client not initialized.")
     token = await get_lark_token()
-    url = f"https://open.larksuite.com/open-apis/im/v1/messages/{message_id}/resources/{file_key}"
     headers = {"Authorization": f"Bearer {token}"}
+    # Use dedicated image endpoint. According to Lark docs, the route is
+    # /open-apis/im/v1/images/:image_key .
+    url = f"https://open.larksuite.com/open-apis/im/v1/images/{image_key}"
     r = await http_client.get(url, headers=headers)
-    # On certain tenants, images cannot be downloaded via the generic resource endpoint. In that case,
-    # fall back to the dedicated image endpoint using the file_key as image_key.
-    if r.status_code == 404 or r.status_code == 403:
-        # Try image endpoint (note: some tenants require image_type param; default works for origin)
-        fallback_url = f"https://open.larksuite.com/open-apis/im/v1/images/{file_key}"
-        r2 = await http_client.get(fallback_url, headers=headers)
-        r2.raise_for_status()
-        return r2.content
+    r.raise_for_status()
+    return r.content
+
+
+async def download_file(message_id: str, file_key: str) -> bytes:
+    """Download a file (non-image) resource from a message. For files (PDF, Word,
+    Excel, etc.), Lark provides the messages/{message_id}/resources/{file_key}
+    endpoint. Images uploaded by the bot can also be fetched here, but user-
+    uploaded images will not be accessible and will return an error. Call
+    download_image() for images instead.
+
+    Args:
+        message_id: The message_id in which the file was sent.
+        file_key: The file_key from the message content.
+
+    Returns:
+        Raw bytes of the file. Raises httpx.HTTPError if the download fails.
+    """
+    if not http_client:
+        raise RuntimeError("HTTP client not initialized.")
+    token = await get_lark_token()
+    headers = {"Authorization": f"Bearer {token}"}
+    url = f"https://open.larksuite.com/open-apis/im/v1/messages/{message_id}/resources/{file_key}"
+    r = await http_client.get(url, headers=headers)
     r.raise_for_status()
     return r.content
 
@@ -444,7 +473,12 @@ async def handle_message_receive(event: dict):
             if not image_key:
                 await send_message_to_lark(chat_id, "收到圖片但缺少 image_key。")
                 return
-            file_bytes = await download_message_resource(message_id, image_key)
+            try:
+                file_bytes = await download_image(image_key)
+            except Exception as e:
+                logger.exception("Failed to download image %s: %s", image_key, e)
+                await send_message_to_lark(chat_id, "抱歉，無法下載圖片內容。請確認機器人權限或稍後再試。")
+                return
             b64 = base64.b64encode(file_bytes).decode("utf-8")
             mm = [system_datetime_message(), {"role": "user", "content": build_image_content(b64)}]
             resp = await call_openai_api(mm)
@@ -455,7 +489,12 @@ async def handle_message_receive(event: dict):
             if not file_key:
                 await send_message_to_lark(chat_id, "收到檔案但缺少 file_key。")
                 return
-            file_bytes = await download_message_resource(message_id, file_key)
+            try:
+                file_bytes = await download_file(message_id, file_key)
+            except Exception as e:
+                logger.exception("Failed to download file %s: %s", file_key, e)
+                await send_message_to_lark(chat_id, "抱歉，無法下載附件內容。請確認機器人權限或稍後再試。")
+                return
             extracted = extract_text_from_file(file_bytes, file_name)
             prompt = f"請閱讀以下檔案內容，使用繁體中文摘要重點：\n\n{extracted[:15000]}"
             mm = [system_datetime_message(), {"role": "user", "content": prompt}]
@@ -475,19 +514,27 @@ async def handle_message_receive(event: dict):
                 try:
                     age = (ts_local - last_media.get("timestamp", ts_local)).total_seconds()
                     if age <= MEDIA_CACHE_TTL:
-                        if last_media.get("type") == "image":
-                            # 讀取並附上上一張圖片內容
-                            file_bytes = await download_message_resource(last_media["message_id"], last_media["key"])
-                            b64 = base64.b64encode(file_bytes).decode("utf-8")
-                            mm.append({"role": "user", "content": build_image_content(b64)})
-                            attached = True
-                        elif last_media.get("type") == "file":
-                            # 讀取並附上上一個檔案內容
-                            file_bytes = await download_message_resource(last_media["message_id"], last_media["key"])
-                            extracted = extract_text_from_file(file_bytes, last_media.get("name") or "")
-                            # 附檔案內容前幾萬字，避免過長
-                            mm.append({"role": "user", "content": f"以下是近期附件內容：\n{extracted[:15000]}"})
-                            attached = True
+                        media_type = last_media.get("type")
+                        if media_type == "image":
+                            # 讀取並附上上一張圖片內容（使用專用圖片端點）
+                            try:
+                                file_bytes = await download_image(last_media["key"])
+                                b64 = base64.b64encode(file_bytes).decode("utf-8")
+                                mm.append({"role": "user", "content": build_image_content(b64)})
+                                attached = True
+                            except Exception as e:
+                                logger.exception("Failed to fetch cached image: %s", e)
+                                LAST_MEDIA_CACHE.pop(chat_id, None)
+                        elif media_type == "file":
+                            # 讀取並附上上一個檔案內容（非圖片）
+                            try:
+                                file_bytes = await download_file(last_media["message_id"], last_media["key"])
+                                extracted = extract_text_from_file(file_bytes, last_media.get("name") or "")
+                                mm.append({"role": "user", "content": f"以下是近期附件內容：\n{extracted[:15000]}"})
+                                attached = True
+                            except Exception as e:
+                                logger.exception("Failed to fetch cached file: %s", e)
+                                LAST_MEDIA_CACHE.pop(chat_id, None)
                 except Exception as e:
                     logger.exception("Failed to fetch cached media: %s", e)
                     # 移除快取以避免下次重複失敗
