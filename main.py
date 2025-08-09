@@ -69,7 +69,8 @@ DATABASE_FILE = os.getenv("DATABASE_FILE", "lark_chat_history.db")  # 資料庫�
 LAST_MEDIA_CACHE: Dict[str, Dict[str, Any]] = {}
 # TTL for cached media in seconds. If user asks a question within this window, we attach the last media.
 # Increased to 5 minutes to allow slightly longer context between media and follow‑up questions.
-MEDIA_CACHE_TTL = 300  # 5 minutes
+# Increase TTL for cached media to 2 hours (7200 seconds) so that follow-up questions can reference earlier images or files
+MEDIA_CACHE_TTL = 7200  # 2 hours
 
 # Name used to mention the bot in group chats. This should match the display name of your bot
 # in Lark (e.g., "Skygpt"). The name is case-insensitive and whitespace trimmed.
