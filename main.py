@@ -234,10 +234,34 @@ async def download_file(message_id: str, file_key: str) -> bytes:
         raise RuntimeError("HTTP client not initialized.")
     token = await get_lark_token()
     headers = {"Authorization": f"Bearer {token}"}
-    url = f"https://open.larksuite.com/open-apis/im/v1/messages/{message_id}/resources/{file_key}"
-    r = await http_client.get(url, headers=headers)
-    r.raise_for_status()
-    return r.content
+    # First try the generic resource endpoint (works for most file types). Some
+    # file attachments may not be accessible via this endpoint, resulting in
+    # 400/403/404 errors. In such cases, we fall back to the dedicated file
+    # download endpoint. Do not raise immediately on error; instead attempt the
+    # fallback below.
+    url1 = f"https://open.larksuite.com/open-apis/im/v1/messages/{message_id}/resources/{file_key}"
+    try:
+        r1 = await http_client.get(url1, headers=headers)
+        if r1.status_code == 200:
+            return r1.content
+    except httpx.HTTPStatusError:
+        # If an HTTPStatusError occurs, fall through to the fallback.
+        pass
+    # Fallback to the dedicated file download endpoint: only works for files
+    # uploaded in chats where the bot has access. According to Lark docs,
+    # /open-apis/im/v1/files/{file_key} returns the file content when the
+    # requesting app has proper permissions and the file was sent in a chat
+    # where the app participates. We attempt this as a second try.
+    url2 = f"https://open.larksuite.com/open-apis/im/v1/files/{file_key}"
+    try:
+        r2 = await http_client.get(url2, headers=headers)
+        if r2.status_code == 200:
+            return r2.content
+    except httpx.HTTPStatusError:
+        pass
+    # If both attempts fail, propagate an error. The caller should catch
+    # httpx.HTTPError and respond with an appropriate message.
+    raise httpx.HTTPError(f"Failed to download file {file_key} in message {message_id}")
 
 # --- Parsing helpers ---
 def _strip_mentions(text: str) -> str:
