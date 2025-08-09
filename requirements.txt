@@ -3,3 +3,8 @@ uvicorn
 gunicorn
 python-dotenv
 httpx
+openpyxl
+python-docx
+python-pptx
+pdfplumber
+pillow
