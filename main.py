@@ -63,6 +63,10 @@ OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o")
 TIMEZONE_OFFSET = int(os.getenv("TIMEZONE_OFFSET", "8"))  # Asia/Taipei UTC+8 by default
 DATABASE_FILE = os.getenv("DATABASE_FILE", "lark_chat_history.db")  # 資料庫檔名
 
+# Name used to mention the bot in group chats. This should match the display name of your bot
+# in Lark (e.g., "Skygpt"). The name is case-insensitive and whitespace trimmed.
+BOT_NAME = os.getenv("BOT_NAME", "").strip()
+
 # [OPTIMIZED] 快速失敗：如果缺少關鍵配置，直接中止程式
 if not all([LARK_APP_ID, LARK_APP_SECRET, VERIFICATION_TOKEN, OPENAI_API_KEY]):
     logger.error("One or more required env vars are missing. Application cannot start.")
@@ -289,6 +293,7 @@ def _is_bot_mentioned_in_group(message: dict) -> bool:
 
     mentions = message.get("mentions", []) or []
     for m in mentions:
+        # Collect all possible id values from the mention (user_id, open_id, app_id, etc.)
         possible_ids = set()
         id_info = m.get("id", {})
         if isinstance(id_info, dict):
@@ -298,7 +303,12 @@ def _is_bot_mentioned_in_group(message: dict) -> bool:
         app_id_top = m.get("app_id")
         if isinstance(app_id_top, str):
             possible_ids.add(app_id_top)
+        # Check if this mention matches the bot's known IDs
         if LARK_APP_ID and LARK_APP_ID in possible_ids:
+            return True
+        # Additionally check if the mention name matches the configured BOT_NAME
+        mention_name = (m.get("name") or "").strip()
+        if BOT_NAME and mention_name.lower() == BOT_NAME.lower():
             return True
 
     raw = message.get("content") or "{}"
@@ -307,10 +317,17 @@ def _is_bot_mentioned_in_group(message: dict) -> bool:
         txt = c.get("text", "")
     except Exception:
         txt = ""
+    # Check <at> tags for id attributes matching the bot's APP_ID
     for attr in ("id", "user_id", "open_id", "app_id"):
-        for m in re.finditer(fr'{attr}="([^"]+)"', txt):
+        for m in re.finditer(fr'{attr}="([^\"]+)"', txt):
             if LARK_APP_ID and m.group(1) == LARK_APP_ID:
                 return True
+    # Finally, check for a plain-text @ mention of the bot's name
+    if BOT_NAME:
+        # Use word boundary after the name to avoid partial matches
+        pattern = re.compile(r'@' + re.escape(BOT_NAME) + r'\b', re.IGNORECASE)
+        if pattern.search(txt):
+            return True
     return False
 
 # --- 主訊息處理 ---
