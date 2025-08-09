@@ -1,5 +1,5 @@
 # Lark SkyGPT - FastAPI webhook with multi-modal, @mention gating in groups, P2P auto-reply,
-# and daily 08:00 summary for previous day's group chats (Asia/Jakarta by default).
+# and daily 08:00 summary for previous day's group chats (Asia/Taipei by default).
 import os
 import json
 import logging
@@ -58,7 +58,7 @@ LARK_APP_SECRET = os.getenv("APP_SECRET")      # Bot APP_SECRET
 VERIFICATION_TOKEN = os.getenv("VERIFICATION_TOKEN")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o")
-TIMEZONE_OFFSET = int(os.getenv("TIMEZONE_OFFSET", "8"))  # Asia/Taipei UTC+7 by default
+TIMEZONE_OFFSET = int(os.getenv("TIMEZONE_OFFSET", "8"))  # Asia/Taipei UTC+8 by default
 DATABASE_FILE = "lark_chat_history.db" # 定義資料庫檔案名稱
 
 if not all([LARK_APP_ID, LARK_APP_SECRET, VERIFICATION_TOKEN, OPENAI_API_KEY]):
@@ -257,10 +257,14 @@ async def webhook(request: Request):
     return {"code": 0}
 
 # --- Message handler with @-mention gating / P2P auto-reply / multi-modal ---
+# ★★★ 以下是更新過的函式 ★★★
 async def handle_message_receive(event: dict):
     message = event.get("message", {})
     if not message:
         return
+
+    # --- 增加日誌，方便追蹤收到的原始訊息 ---
+    logger.info("Received message payload: %s", json.dumps(message))
 
     chat_type = message.get("chat_type")        # "p2p" or "group"
     chat_id = message.get("chat_id")
@@ -292,18 +296,29 @@ async def handle_message_receive(event: dict):
     if all([message_id, chat_id, chat_type, summary_text]):
         log_message_to_db(message_id, chat_id, chat_type, ts_local, summary_text)
 
-    # --- Trigger rules ---
+    # --- Trigger rules (使用更穩健的判斷邏輯) ---
     is_trigger = False
     if chat_type == "p2p":
         is_trigger = True
+        logger.info("Triggered by P2P chat.")
     elif chat_type == "group":
         mentions = message.get("mentions", []) or []
         for m in mentions:
-            if m.get('id', {}).get('app_id') == LARK_APP_ID: # 簡化判斷
+            # 防禦性檢查，涵蓋多種可能的 ID 格式
+            id_union = m.get("id", {})
+            possible_ids = set()
+            if id_union.get("app_id"):
+                possible_ids.add(id_union.get("app_id"))
+            if id_union.get("open_id"):
+                possible_ids.add(id_union.get("open_id"))
+
+            if LARK_APP_ID in possible_ids:
                 is_trigger = True
+                logger.info("Triggered by @mention in group.")
                 break
+    
     if not is_trigger:
-        logger.info("Ignored message (no @mention in group or unsupported chat type).")
+        logger.info("Ignored message (no @mention in group or not P2P).")
         return
 
     # --- Branch by message type ---
