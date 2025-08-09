@@ -68,7 +68,8 @@ DATABASE_FILE = os.getenv("DATABASE_FILE", "lark_chat_history.db")  # 資料庫�
 # key (image_key or file_key), optional file_name, message_id, and timestamp (datetime).
 LAST_MEDIA_CACHE: Dict[str, Dict[str, Any]] = {}
 # TTL for cached media in seconds. If user asks a question within this window, we attach the last media.
-MEDIA_CACHE_TTL = 180  # 3 minutes
+# Increased to 5 minutes to allow slightly longer context between media and follow‑up questions.
+MEDIA_CACHE_TTL = 300  # 5 minutes
 
 # Name used to mention the bot in group chats. This should match the display name of your bot
 # in Lark (e.g., "Skygpt"). The name is case-insensitive and whitespace trimmed.
@@ -374,7 +375,8 @@ async def handle_message_receive(event: dict):
     if all([message_id, chat_id, chat_type, summary_text]):
         await log_message_to_db(message_id, chat_id, chat_type, ts_local, summary_text)
 
-    # 更新媒體快取：記錄該聊天室最近的圖片或檔案（3分鐘內有效）
+    # 更新媒體快取：記錄該聊天室最近的圖片或檔案。
+    # 我們僅透過 chat_id 做快取，避免 sender 比對錯誤；TTL 控制有效期。
     try:
         if msg_type == "image":
             image_key = content.get("image_key")
@@ -393,6 +395,27 @@ async def handle_message_receive(event: dict):
                     "type": "file",
                     "key": file_key,
                     "name": file_name,
+                    "message_id": message_id,
+                    "timestamp": ts_local,
+                }
+        # 如果是文字消息，但其中包含 image_key 或 file_key，表示這可能是引用（reply）或嵌入的媒體。
+        elif msg_type == "text":
+            # Some reply messages embed the media key directly in the content (e.g., quoted messages).
+            embedded_image_key = content.get("image_key")
+            embedded_file_key = content.get("file_key")
+            if embedded_image_key:
+                # 優先將這當作圖片訊息快取
+                LAST_MEDIA_CACHE[chat_id] = {
+                    "type": "image",
+                    "key": embedded_image_key,
+                    "message_id": message_id,
+                    "timestamp": ts_local,
+                }
+            elif embedded_file_key:
+                LAST_MEDIA_CACHE[chat_id] = {
+                    "type": "file",
+                    "key": embedded_file_key,
+                    "name": content.get("file_name") or "",
                     "message_id": message_id,
                     "timestamp": ts_local,
                 }
