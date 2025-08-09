@@ -58,7 +58,7 @@ LARK_APP_SECRET = os.getenv("APP_SECRET")      # Bot APP_SECRET
 VERIFICATION_TOKEN = os.getenv("VERIFICATION_TOKEN")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o")
-TIMEZONE_OFFSET = int(os.getenv("TIMEZONE_OFFSET", "7"))  # Asia/Jakarta UTC+7 by default
+TIMEZONE_OFFSET = int(os.getenv("TIMEZONE_OFFSET", "8"))  # Asia/Taipei UTC+7 by default
 DATABASE_FILE = "lark_chat_history.db" # 定義資料庫檔案名稱
 
 if not all([LARK_APP_ID, LARK_APP_SECRET, VERIFICATION_TOKEN, OPENAI_API_KEY]):
