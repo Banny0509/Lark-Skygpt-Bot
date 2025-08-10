@@ -7,7 +7,9 @@ import logging
 import re
 import base64
 from io import BytesIO
-from datetime import datetime, timezone, timedelta
+# import time explicitly so that we can construct time objects without
+# relying on the datetime.datetime class (which treats .time() as an instance method)
+from datetime import datetime, timezone, timedelta, time
 from typing import Optional, Dict, List, Tuple, Any
 from collections import defaultdict
 import asyncio
@@ -597,7 +599,9 @@ async def daily_summary_scheduler():
             # avoids issues where .replace() may produce unexpected results on
             # timezone-aware datetimes.
             today = now_dt.date()
-            next_run = datetime.combine(today, datetime.time(8, 0), tzinfo=now_dt.tzinfo)
+            # Use the standalone time class imported from datetime instead of
+            # datetime.time(), which is a descriptor on the datetime.datetime class
+            next_run = datetime.combine(today, time(8, 0), tzinfo=now_dt.tzinfo)
             if now_dt >= next_run:
                 next_run += timedelta(days=1)
             wait_seconds = (next_run - now_dt).total_seconds()
@@ -611,10 +615,10 @@ async def daily_summary_scheduler():
             # At the scheduled time, compute the date range for the previous day.
             run_time = now_local()
             yesterday = (run_time - timedelta(days=1)).date()
-            day_start = datetime.combine(yesterday, datetime.time(0, 0), tzinfo=run_time.tzinfo)
+            day_start = datetime.combine(yesterday, time(0, 0), tzinfo=run_time.tzinfo)
             day_end = datetime.combine(
                 yesterday,
-                datetime.time(23, 59, 59, 999999),
+                time(23, 59, 59, 999999),
                 tzinfo=run_time.tzinfo,
             )
 
