@@ -581,48 +581,84 @@ async def handle_message_receive(event: dict):
 
 # --- [OPTIMIZED] 每日 08:00 摘要 (邏輯更穩健) ---
 async def daily_summary_scheduler():
+    """
+    Background task that runs once per day at 08:00 local time (as determined by
+    TIMEZONE_OFFSET) and summarizes the previous day's group chats.  This
+    implementation avoids subtle bugs with timezone-aware datetimes by
+    constructing the next run time via datetime.combine(), rather than
+    using .replace() on a potentially timezone-aware datetime.  It also
+    computes the previous day's start and end boundaries using explicit date
+    arithmetic.
+    """
     while True:
         try:
             now_dt = now_local()
-            next_run = now_dt.replace(hour=8, minute=0, second=0, microsecond=0)
+            # Compute the next run time at 08:00 local time.  Using datetime.combine
+            # avoids issues where .replace() may produce unexpected results on
+            # timezone-aware datetimes.
+            today = now_dt.date()
+            next_run = datetime.combine(today, datetime.time(8, 0), tzinfo=now_dt.tzinfo)
             if now_dt >= next_run:
                 next_run += timedelta(days=1)
             wait_seconds = (next_run - now_dt).total_seconds()
-            logger.info("Scheduler: Next summary run at %s (in %.2f hours)", next_run, wait_seconds / 3600)
+            logger.info(
+                "Scheduler: Next summary run at %s (in %.2f hours)",
+                next_run,
+                wait_seconds / 3600,
+            )
             await asyncio.sleep(wait_seconds)
 
+            # At the scheduled time, compute the date range for the previous day.
             run_time = now_local()
-            day_start = (run_time - timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
-            day_end = (run_time - timedelta(days=1)).replace(hour=23, minute=59, second=59, microsecond=999999)
+            yesterday = (run_time - timedelta(days=1)).date()
+            day_start = datetime.combine(yesterday, datetime.time(0, 0), tzinfo=run_time.tzinfo)
+            day_end = datetime.combine(
+                yesterday,
+                datetime.time(23, 59, 59, 999999),
+                tzinfo=run_time.tzinfo,
+            )
 
             chats_to_summarize = await get_chats_for_summary(day_start, day_end)
             if not chats_to_summarize:
-                logger.info("No new group chats to summarize for %s.", day_start.strftime('%Y-%m-%d'))
+                logger.info(
+                    "No new group chats to summarize for %s.",
+                    day_start.strftime('%Y-%m-%d'),
+                )
                 continue
 
             for chat_id, messages in chats_to_summarize.items():
                 if not messages:
                     continue
-                
-                content_lines = [f"{m['timestamp'].strftime('%H:%M')}: {m['text']}" for m in messages]
+                content_lines = [
+                    f"{m['timestamp'].strftime('%H:%M')}: {m['text']}" for m in messages
+                ]
                 combined = "\n".join(content_lines)
-                prompt = "請將以下群組聊天記錄整理成摘要（繁體中文，條列式，含關鍵決策、待辦、未決問題）：\n\n" + combined[:15000]
-                
+                prompt = (
+                    "請將以下群組聊天記錄整理成摘要（繁體中文，條列式，含關鍵決策、待辦、未決問題）：\n\n"
+                    + combined[:15000]
+                )
                 try:
-                    resp = await call_openai_api([system_datetime_message(), {"role": "user", "content": prompt}])
+                    resp = await call_openai_api(
+                        [system_datetime_message(), {"role": "user", "content": prompt}]
+                    )
                     summary = resp["choices"][0]["message"]["content"].strip()
-                    await send_message_to_lark(chat_id, f"昨日聊天摘要 ({day_start.strftime('%Y-%m-%d')}):\n{summary}")
-                    
+                    await send_message_to_lark(
+                        chat_id,
+                        f"昨日聊天摘要 ({day_start.strftime('%Y-%m-%d')}):\n{summary}",
+                    )
                     # 成功發送摘要後，才標記這個聊天室的訊息為已處理
                     await mark_chat_messages_as_summarized(chat_id, day_start, day_end)
-
                 except Exception as e:
-                    logger.exception("Summary generation/sending failed for chat_id %s. Will retry next cycle. Error: %s", chat_id, e)
+                    logger.exception(
+                        "Summary generation/sending failed for chat_id %s. Will retry next cycle. Error: %s",
+                        chat_id,
+                        e,
+                    )
                     # 失敗後不標記，以便下次重試
-
         except Exception as e:
             logger.exception("daily_summary_scheduler error: %s", e)
-            await asyncio.sleep(60) # 發生重大錯誤時，等待1分鐘後重試
+            # 發生重大錯誤時，等待 1 分鐘後重試
+            await asyncio.sleep(60)
 
 # --- FastAPI 生命週期事件 ---
 @app.on_event("startup")
