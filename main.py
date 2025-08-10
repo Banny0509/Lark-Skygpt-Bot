@@ -519,7 +519,18 @@ async def handle_message_receive(event: dict):
                 file_bytes = await download_file(message_id, file_key)
             except Exception as e:
                 logger.exception("Failed to download file %s: %s", file_key, e)
-                await send_message_to_lark(chat_id, "抱歉，無法下載附件內容。請確認機器人權限或稍後再試。")
+                # When a file cannot be downloaded it is often because it is a
+                # cloud‑based document or link that the bot does not have
+                # permission to access.  Inform the user clearly rather
+                # than exposing the raw URL in the chat.
+                await send_message_to_lark(
+                    chat_id,
+                    (
+                        "抱歉，我無法直接訪問或下載此檔案的內容。這類雲端連結或共享檔案需要"
+                        "適當權限，請確認機器人已獲得檔案存取權，或將檔案下載後以附件形式"
+                        "重新上傳。"
+                    ),
+                )
                 return
             extracted = extract_text_from_file(file_bytes, file_name)
             prompt = f"請閱讀以下檔案內容，使用繁體中文摘要重點：\n\n{extracted[:15000]}"
