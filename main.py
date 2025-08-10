@@ -261,9 +261,28 @@ async def download_file(message_id: str, file_key: str) -> bytes:
             return r2.content
     except httpx.HTTPStatusError:
         pass
-    # If both attempts fail, propagate an error. The caller should catch
+    # Third fallback: attempt to download from the drive API.  Certain cloud
+    # attachments (file tokens beginning with file_v3, etc.) live in Lark
+    # Drive instead of the IM resource store.  According to Lark's API
+    # documentation, files can be downloaded via
+    # /open-apis/drive/v1/files/:file_token/download.  We use the same
+    # file_key/token here.  Note that the app must have drive:file:read
+    # permissions enabled, and the user who uploaded the file must have
+    # granted access to the bot.  If this attempt fails, we will fall
+    # through to raising an exception.
+    url3 = f"https://open.larksuite.com/open-apis/drive/v1/files/{file_key}/download"
+    try:
+        r3 = await http_client.get(url3, headers=headers)
+        if r3.status_code == 200:
+            return r3.content
+    except httpx.HTTPStatusError:
+        pass
+
+    # If all attempts fail, propagate an error. The caller should catch
     # httpx.HTTPError and respond with an appropriate message.
-    raise httpx.HTTPError(f"Failed to download file {file_key} in message {message_id}")
+    raise httpx.HTTPError(
+        f"Failed to download file {file_key} in message {message_id}; tried IM resource, IM file, and drive download endpoints"
+    )
 
 # --- Parsing helpers ---
 def _strip_mentions(text: str) -> str:
