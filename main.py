@@ -512,8 +512,15 @@ async def handle_message_receive(event: dict):
 
         elif msg_type == "file":
             file_key, file_name = content.get("file_key"), content.get("file_name") or "附件"
+            # 當缺少 file_key 時，通常代表檔案是雲端連結或外部分享，機器人無法直接下載
             if not file_key:
-                await send_message_to_lark(chat_id, "收到檔案但缺少 file_key。")
+                await send_message_to_lark(
+                    chat_id,
+                    (
+                        "抱歉，這個檔案似乎是雲端連結或外部分享，機器人無法直接下載。"
+                        "請確認已為機器人開啟適當的檔案存取權限，或先下載後再以附件形式上傳。"
+                    ),
+                )
                 return
             try:
                 file_bytes = await download_file(message_id, file_key)
