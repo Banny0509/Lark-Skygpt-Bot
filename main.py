@@ -305,6 +305,29 @@ def extract_text_from_file(file_bytes: bytes, file_name: str) -> str:
         return f"[解析 {file_name} 發生錯誤: {e}]"
     return f"[不支援的檔案或缺少解析庫: {file_name}]"
 
+def pdf_page_to_image_bytes(pdf_bytes: bytes) -> Optional[bytes]:
+    """
+    Attempt to convert the first page of a PDF to a PNG image.
+    Returns the PNG bytes if successful, else None.
+    Requires pdfplumber and PIL/Pillow.
+    """
+    if pdfplumber is None or Image is None:
+        return None
+    try:
+        with pdfplumber.open(BytesIO(pdf_bytes)) as pdf:
+            if not pdf.pages:
+                return None
+            page = pdf.pages[0]
+            # The to_image() API returns a PageImage. Use .original to get PIL Image
+            page_img = page.to_image(resolution=150)
+            pil_img = page_img.original
+            buf = BytesIO()
+            pil_img.save(buf, format="PNG")
+            return buf.getvalue()
+    except Exception as e:
+        logger.exception("pdf_page_to_image_bytes error: %s", e)
+        return None
+
 
 def build_image_content(b64_png: str, user_hint: str = "請閱讀此圖片並回覆重點或回答問題。") -> List[dict]:
     return [
@@ -511,8 +534,9 @@ async def handle_message_receive(event: dict):
             reply = resp["choices"][0]["message"]["content"].strip()
 
         elif msg_type == "file":
-            file_key, file_name = content.get("file_key"), content.get("file_name") or "附件"
-            # 當缺少 file_key 時，通常代表檔案是雲端連結或外部分享，機器人無法直接下載
+            file_key = content.get("file_key")
+            file_name = content.get("file_name") or "附件"
+            # If no file_key exists, this is likely a cloud link or external share. Inform user.
             if not file_key:
                 await send_message_to_lark(
                     chat_id,
@@ -526,20 +550,32 @@ async def handle_message_receive(event: dict):
                 file_bytes = await download_file(message_id, file_key)
             except Exception as e:
                 logger.exception("Failed to download file %s: %s", file_key, e)
-                # When a file cannot be downloaded it is often because it is a
-                # cloud‑based document or link that the bot does not have
-                # permission to access.  Inform the user clearly rather
-                # than exposing the raw URL in the chat.
                 await send_message_to_lark(
                     chat_id,
                     (
                         "抱歉，我無法直接訪問或下載此檔案的內容。這類雲端連結或共享檔案需要"
-                        "適當權限，請確認機器人已獲得檔案存取權，或將檔案下載後以附件形式"
-                        "重新上傳。"
+                        "適當權限，請確認機器人已獲得檔案存取權，或將檔案下載後以附件形式重新上傳。"
                     ),
                 )
                 return
+            # Try to extract text from the file. If extraction fails for PDF, attempt image conversion.
             extracted = extract_text_from_file(file_bytes, file_name)
+            if file_name.lower().endswith(".pdf"):
+                # If extraction result suggests unsupported or blank PDF, try converting first page to image
+                if extracted.startswith("["):
+                    img_bytes = pdf_page_to_image_bytes(file_bytes)
+                    if img_bytes:
+                        try:
+                            b64 = base64.b64encode(img_bytes).decode("utf-8")
+                            mm = [system_datetime_message(), {"role": "user", "content": build_image_content(b64, "請閱讀此文件第一頁並摘要重點。")}]
+                            resp = await call_openai_api(mm)
+                            reply = resp["choices"][0]["message"]["content"].strip()
+                            await send_message_to_lark(chat_id, reply)
+                            return
+                        except Exception as e:
+                            logger.exception("Failed to process PDF via image: %s", e)
+                            # fall back to text summarization below
+            # For all files (including PDFs if extraction succeeded or image fallback failed), send text summary
             prompt = f"請閱讀以下檔案內容，使用繁體中文摘要重點：\n\n{extracted[:15000]}"
             mm = [system_datetime_message(), {"role": "user", "content": prompt}]
             resp = await call_openai_api(mm)
@@ -573,9 +609,22 @@ async def handle_message_receive(event: dict):
                             # 讀取並附上上一個檔案內容（非圖片）
                             try:
                                 file_bytes = await download_file(last_media["message_id"], last_media["key"])
-                                extracted = extract_text_from_file(file_bytes, last_media.get("name") or "")
-                                mm.append({"role": "user", "content": f"以下是近期附件內容：\n{extracted[:15000]}"})
-                                attached = True
+                                file_name = last_media.get("name") or ""
+                                extracted = extract_text_from_file(file_bytes, file_name)
+                                # If this is a PDF and extraction fails, attempt to convert first page to image
+                                if file_name.lower().endswith(".pdf") and extracted.startswith("["):
+                                    img_bytes = pdf_page_to_image_bytes(file_bytes)
+                                    if img_bytes:
+                                        b64 = base64.b64encode(img_bytes).decode("utf-8")
+                                        mm.append({"role": "user", "content": build_image_content(b64, "請閱讀此文件第一頁並摘要重點。")})
+                                        attached = True
+                                    else:
+                                        # fallback to extracted text (error message) below
+                                        mm.append({"role": "user", "content": f"以下是近期附件內容：\n{extracted[:15000]}"})
+                                        attached = True
+                                else:
+                                    mm.append({"role": "user", "content": f"以下是近期附件內容：\n{extracted[:15000]}"})
+                                    attached = True
                             except Exception as e:
                                 logger.exception("Failed to fetch cached file: %s", e)
                                 LAST_MEDIA_CACHE.pop(chat_id, None)
