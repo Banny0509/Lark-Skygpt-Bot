@@ -1,854 +1,633 @@
-# Lark SkyGPT - FastAPI webhook with multi-modal, @mention gating in groups, P2P auto-reply,
-# and daily 08:00 summary for previous day's group chats (Asia/Taipei by default).
-# --- OPTIMIZED VERSION ---
+# main.py — Lark SkyGPT Bot (per-chat daily summary)
+# 功能：
+#   - Webhook：/webhook 與 /webhook/lark（兩條路徑皆可）
+#   - 正確下載端點：/im/v1/messages/{message_id}/resources/{key}?type=file|image
+#   - 每天 08:00 (Asia/Taipei) 對「昨天有聊天」的每個群，各自發該群摘要（DB 鎖防重覆）
+#   - 問答含時間感知、圖片理解、文件讀取與摘要
+#   - 單 worker 友善（建議 Gunicorn -w 1）
+
 import os
-import json
-import logging
+import io
 import re
+import json
 import base64
-from io import BytesIO
-# import time explicitly so that we can construct time objects without
-# relying on the datetime.datetime class (which treats .time() as an instance method)
-from datetime import datetime, timezone, timedelta, time
-from typing import Optional, Dict, List, Tuple, Any
-from collections import defaultdict
+import logging
+import mimetypes
 import asyncio
-from sys import exit as sys_exit # 用於啟動失敗時退出
+from typing import Optional, Tuple, List, Dict, Any
+from datetime import datetime, timedelta, timezone
 
 import httpx
-from fastapi import FastAPI, Request, HTTPException
-import aiosqlite  # [OPTIMIZED] 使用 aiosqlite 進行異步資料庫操作
+from fastapi import FastAPI, Request
+from fastapi.responses import JSONResponse, PlainTextResponse
+from zoneinfo import ZoneInfo
 
-# Optional parsers for office/PDF and images
 try:
-    import pdfplumber  # type: ignore
+    import aiosqlite
 except Exception:
-    pdfplumber = None
-try:
-    import openpyxl  # type: ignore
-except Exception:
-    openpyxl = None
-try:
-    import docx  # type: ignore  # python-docx
-except Exception:
-    docx = None
-try:
-    import pptx  # type: ignore  # python-pptx
-except Exception:
-    pptx = None
-try:
-    from PIL import Image  # type: ignore
-except Exception:
-    Image = None
+    aiosqlite = None
 
-logging.basicConfig(level=logging.INFO,
-                    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
-logger = logging.getLogger("lark-skygpt")
+try:
+    from pypdf import PdfReader
+    HAVE_PYPDF = True
+except Exception:
+    HAVE_PYPDF = False
 
-# Load .env locally when not on Railway (or other prod)
-if "RAILWAY_ENVIRONMENT" not in os.environ:
+try:
+    import docx2txt
+    HAVE_DOCX = True
+except Exception:
+    HAVE_DOCX = False
+
+# OpenAI（可選）
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
+USE_OPENAI = bool(OPENAI_API_KEY)
+if USE_OPENAI:
     try:
-        from dotenv import load_dotenv  # type: ignore
-        load_dotenv()
-        logger.info("Loaded .env for local development")
+        from openai import OpenAI
+        oai_client = OpenAI(api_key=OPENAI_API_KEY)
     except Exception:
-        pass
+        USE_OPENAI = False
+        oai_client = None
 
-app = FastAPI()
+APP_ID = os.getenv("APP_ID", "").strip()
+APP_SECRET = os.getenv("APP_SECRET", "").strip()
+LARK_BASE = "https://open.larksuite.com"
+TIMEZONE = os.getenv("TZ", "Asia/Taipei")
+TZ = ZoneInfo(TIMEZONE)
+DB_PATH = os.getenv("DB_PATH", "data.db")
 
-# --- Environment ---
-LARK_APP_ID = os.getenv("APP_ID")              # Bot APP_ID (string like cli_aaxxx)
-LARK_APP_SECRET = os.getenv("APP_SECRET")      # Bot APP_SECRET
-VERIFICATION_TOKEN = os.getenv("VERIFICATION_TOKEN")
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o")
-TIMEZONE_OFFSET = int(os.getenv("TIMEZONE_OFFSET", "8"))  # Asia/Taipei UTC+8 by default
-DATABASE_FILE = os.getenv("DATABASE_FILE", "lark_chat_history.db")  # 資料庫檔名
+logging.basicConfig(
+    level=os.getenv("LOG_LEVEL", "INFO"),
+    format="%(asctime)s %(levelname)s %(name)s :: %(message)s",
+)
+logger = logging.getLogger("skygpt")
+app = FastAPI(title="Lark SkyGPT Bot")
 
-# [IMAGE/FORWARD] Cache for the most recent media (image or file) in each chat.  
-# Keyed by chat_id. Each value is a dict storing type ("image" or "file"),
-# key (image_key or file_key), optional file_name, message_id, and timestamp (datetime).
-LAST_MEDIA_CACHE: Dict[str, Dict[str, Any]] = {}
-# TTL for cached media in seconds. If user asks a question within this window, we attach the last media.
-# Increased to 5 minutes to allow slightly longer context between media and follow‑up questions.
-# Increase TTL for cached media to 2 hours (7200 seconds) so that follow-up questions can reference earlier images or files
-MEDIA_CACHE_TTL = 7200  # 2 hours
+# ====== Token 快取 ======
+_token_cache: Dict[str, Any] = {"tenant_access_token": None, "expire_at": 0}
 
-# Name used to mention the bot in group chats. This should match the display name of your bot
-# in Lark (e.g., "Skygpt"). The name is case-insensitive and whitespace trimmed.
-BOT_NAME = os.getenv("BOT_NAME", "").strip()
-
-# [OPTIMIZED] 快速失敗：如果缺少關鍵配置，直接中止程式
-if not all([LARK_APP_ID, LARK_APP_SECRET, VERIFICATION_TOKEN, OPENAI_API_KEY]):
-    logger.error("One or more required env vars are missing. Application cannot start.")
-    sys_exit("Fatal: Missing required environment variables.")
-
-# [OPTIMIZED] 全域共用的 HTTP 客戶端，由 FastAPI 生命週期管理
-http_client: Optional[httpx.AsyncClient] = None
-
-# --- [OPTIMIZED] 異步資料庫函式 (Async Database Functions) ---
-async def init_db():
-    """初始化資料庫和資料表"""
-    async with aiosqlite.connect(DATABASE_FILE) as con:
-        await con.execute(
-            """
-            CREATE TABLE IF NOT EXISTS chat_history (
-                message_id TEXT PRIMARY KEY,
-                chat_id TEXT NOT NULL,
-                chat_type TEXT NOT NULL,
-                timestamp TEXT NOT NULL,
-                text TEXT,
-                summarized INTEGER DEFAULT 0
-            )
-            """
-        )
-        # This table ensures that only a single daily summary is sent per chat per date.
-        # The combination of (chat_id, date) must be unique. When the scheduler runs it will
-        # attempt to insert a row into this table for the previous day and skip summarizing
-        # that chat if the row already exists. This prevents duplicate summaries when
-        # multiple worker processes execute the scheduler concurrently.
-        await con.execute(
-            """
-            CREATE TABLE IF NOT EXISTS summary_lock (
-                chat_id TEXT NOT NULL,
-                date TEXT NOT NULL,
-                UNIQUE(chat_id, date)
-            )
-            """
-        )
-        await con.commit()
-    logger.info("Database initialized successfully: %s", DATABASE_FILE)
-
-async def log_message_to_db(message_id: str, chat_id: str, chat_type: str, timestamp: datetime, text: str):
-    """將訊息非阻塞地紀錄到資料庫"""
-    async with aiosqlite.connect(DATABASE_FILE) as con:
-        try:
-            await con.execute(
-                "INSERT INTO chat_history (message_id, chat_id, chat_type, timestamp, text) VALUES (?, ?, ?, ?, ?)",
-                (message_id, chat_id, chat_type, timestamp.isoformat(), text)
-            )
-            await con.commit()
-        except aiosqlite.IntegrityError:
-            logger.warning("Message with ID %s already exists.", message_id)
-        except Exception as e:
-            logger.exception("Failed to log message to DB: %s", e)
-
-async def get_chats_for_summary(start_date: datetime, end_date: datetime) -> Dict[str, List[Dict]]:
-    """從資料庫非阻塞地獲取需要摘要的群組聊天紀錄"""
-    chats = defaultdict(list)
-    async with aiosqlite.connect(DATABASE_FILE) as con:
-        con.row_factory = aiosqlite.Row
-        async with con.execute(
-            "SELECT chat_id, timestamp, text FROM chat_history "
-            "WHERE chat_type = 'group' AND summarized = 0 AND timestamp BETWEEN ? AND ? "
-            "ORDER BY timestamp ASC",
-            (start_date.isoformat(), end_date.isoformat())
-        ) as cursor:
-            async for row in cursor:
-                chats[row['chat_id']].append({
-                    "timestamp": datetime.fromisoformat(row['timestamp']),
-                    "text": row['text']
-                })
-    return chats
-
-async def mark_chat_messages_as_summarized(chat_id: str, start_date: datetime, end_date: datetime):
-    """[OPTIMIZED] 將指定聊天室的已摘要訊息在資料庫中標記"""
-    async with aiosqlite.connect(DATABASE_FILE) as con:
-        await con.execute(
-            "UPDATE chat_history SET summarized = 1 WHERE chat_id = ? AND timestamp BETWEEN ? AND ?",
-            (chat_id, start_date.isoformat(), end_date.isoformat())
-        )
-        await con.commit()
-
-
-# --- Summary lock helpers ---
-async def acquire_summary_lock(chat_id: str, summary_date: str) -> bool:
-    """
-    Attempt to acquire a lock for a given chat_id and date.  This prevents
-    duplicate daily summaries from being generated when multiple worker
-    processes attempt to run the scheduler concurrently.  Returns True if
-    the lock was acquired (i.e. a new row was inserted), False if a row
-    already exists (i.e. another process has already summarized this chat
-    for the given date).
-
-    Args:
-        chat_id: The ID of the chat to summarize.
-        summary_date: The date (YYYY-MM-DD) for which the summary is being
-            generated.  Typically the previous day's date.
-
-    Returns:
-        Boolean indicating whether the lock was successfully acquired.
-    """
-    async with aiosqlite.connect(DATABASE_FILE) as con:
-        try:
-            await con.execute(
-                "INSERT INTO summary_lock (chat_id, date) VALUES (?, ?)",
-                (chat_id, summary_date),
-            )
-            await con.commit()
-            return True
-        except aiosqlite.IntegrityError:
-            # Row already exists, meaning another scheduler instance has taken the lock.
-            return False
-    logger.info("Marked messages for chat_id %s from %s to %s as summarized.", chat_id, start_date, end_date)
-
-# --- 時間工具與健康檢查 ---
-def now_local() -> datetime:
-    return datetime.now(timezone(timedelta(hours=TIMEZONE_OFFSET)))
-
-def format_datetime_info(dt: Optional[datetime] = None) -> str:
-    dt = dt or now_local()
-    tz_sign = "+" if TIMEZONE_OFFSET >= 0 else "-"
-    tz_abs = abs(TIMEZONE_OFFSET)
-    weekday_map = ["星期一","星期二","星期三","星期四","星期五","星期六","星期日"]
-    weekday = weekday_map[dt.isoweekday()-1]
-    return f"{dt.strftime('%Y-%m-%d %H:%M:%S')} (Asia/Taipei, UTC{tz_sign}{tz_abs:02d}:00, {weekday})"
-
-@app.get("/health")
-async def health():
-    return {"status": "ok", "now": format_datetime_info()}
-
-# --- Lark helper functions (using shared client) ---
-async def get_lark_token() -> str:
-    if not http_client:
-        raise RuntimeError("HTTP client not initialized.")
-    resp = await http_client.post(
-        "https://open.larksuite.com/open-apis/auth/v3/tenant_access_token/internal",
-        json={"app_id": LARK_APP_ID, "app_secret": LARK_APP_SECRET},
-    )
-    resp.raise_for_status()
-    data = resp.json()
-    token = data.get("tenant_access_token")
-    if not token:
-        raise RuntimeError(f"Failed to get tenant_access_token: {data}")
-    return token
-
-async def send_message_to_lark(chat_id: str, text: str) -> None:
-    if not http_client:
-        raise RuntimeError("HTTP client not initialized.")
-    token = await get_lark_token()
-    headers = {
-        "Authorization": f"Bearer {token}",
-        "Content-Type": "application/json; charset=utf-8",
-    }
-    payload = {"receive_id": chat_id, "msg_type": "text", "content": json.dumps({"text": text}, ensure_ascii=False)}
-    r = await http_client.post(
-        "https://open.larksuite.com/open-apis/im/v1/messages?receive_id_type=chat_id",
-        headers=headers, json=payload
-    )
-    try:
+async def get_tenant_access_token() -> str:
+    now = int(datetime.now(tz=timezone.utc).timestamp())
+    if _token_cache["tenant_access_token"] and now < _token_cache["expire_at"] - 60:
+        return _token_cache["tenant_access_token"]
+    url = f"{LARK_BASE}/open-apis/auth/v3/tenant_access_token/internal"
+    async with httpx.AsyncClient(timeout=20.0) as client:
+        r = await client.post(url, json={"app_id": APP_ID, "app_secret": APP_SECRET})
         r.raise_for_status()
-    except Exception:
-        logger.error("send_message_to_lark failed: %s", r.text)
+        data = r.json()
+    tat = data.get("tenant_access_token")
+    expire = int(data.get("expire", 3600))
+    _token_cache["tenant_access_token"] = tat
+    _token_cache["expire_at"] = now + expire
+    return tat
 
-async def download_image(image_key: str) -> bytes:
-    """Download an image using the dedicated image endpoint. Images uploaded by users
-    can only be downloaded via this endpoint; attempting to fetch them via the
-    generic resource endpoint will return a 400/403 error. The caller must pass
-    a valid image_key obtained from the message content.
-
-    Args:
-        image_key: The image_key field from the message content.
-
-    Returns:
-        Raw bytes of the image. Raises httpx.HTTPError if the download fails.
-    """
-    if not http_client:
-        raise RuntimeError("HTTP client not initialized.")
-    token = await get_lark_token()
-    headers = {"Authorization": f"Bearer {token}"}
-    # Use dedicated image endpoint. According to Lark docs, the route is
-    # /open-apis/im/v1/images/:image_key .
-    url = f"https://open.larksuite.com/open-apis/im/v1/images/{image_key}"
-    r = await http_client.get(url, headers=headers)
-    r.raise_for_status()
-    return r.content
-
-
-async def download_file(message_id: str, file_key: str) -> bytes:
-    """Download a file (non-image) resource from a message. For files (PDF, Word,
-    Excel, etc.), Lark provides the messages/{message_id}/resources/{file_key}
-    endpoint. Images uploaded by the bot can also be fetched here, but user-
-    uploaded images will not be accessible and will return an error. Call
-    download_image() for images instead.
-
-    Args:
-        message_id: The message_id in which the file was sent.
-        file_key: The file_key from the message content.
-
-    Returns:
-        Raw bytes of the file. Raises httpx.HTTPError if the download fails.
-    """
-    if not http_client:
-        raise RuntimeError("HTTP client not initialized.")
-    token = await get_lark_token()
-    headers = {"Authorization": f"Bearer {token}"}
-        # Use messages/{message_id}/resources/{file_key} endpoint exclusively
-    url = f"https://open.larksuite.com/open-apis/im/v1/messages/{message_id}/resources/{file_key}"
-    r = await http_client.get(url, headers=headers)
-    r.raise_for_status()
-    return r.content
-
-    # First try the generic resource endpoint (works for most file types). Some
-    # file attachments may not be accessible via this endpoint, resulting in
-    # 400/403/404 errors. In such cases, we fall back to the dedicated file
-    # download endpoint. Do not raise immediately on error; instead attempt the
-    # fallback below.
-    url1 = f"https://open.larksuite.com/open-apis/im/v1/messages/{message_id}/resources/{file_key}"
-    try:
-        r1 = await http_client.get(url1, headers=headers)
-        if r1.status_code == 200:
-            return r1.content
-    except httpx.HTTPStatusError:
-        # If an HTTPStatusError occurs, fall through to the fallback.
-        pass
-    # Fallback to the dedicated file download endpoint: only works for files
-    # uploaded in chats where the bot has access. According to Lark docs,
-    # /open-apis/im/v1/files/{file_key} returns the file content when the
-    # requesting app has proper permissions and the file was sent in a chat
-    # where the app participates. We attempt this as a second try.
-    url2 = f"https://open.larksuite.com/open-apis/im/v1/files/{file_key}"
-    try:
-        r2 = await http_client.get(url2, headers=headers)
-        if r2.status_code == 200:
-            return r2.content
-    except httpx.HTTPStatusError:
-        pass
-    # Third fallback: attempt to download from the drive API.  Certain cloud
-    # attachments (file tokens beginning with file_v3, etc.) live in Lark
-    # Drive instead of the IM resource store.  According to Lark's API
-    # documentation, files can be downloaded via
-    # /open-apis/drive/v1/files/:file_token/download.  We use the same
-    # file_key/token here.  Note that the app must have drive:file:read
-    # permissions enabled, and the user who uploaded the file must have
-    # granted access to the bot.  If this attempt fails, we will fall
-    # through to raising an exception.
-    url3 = f"https://open.larksuite.com/open-apis/drive/v1/files/{file_key}/download"
-    try:
-        r3 = await http_client.get(url3, headers=headers)
-        if r3.status_code == 200:
-            return r3.content
-    except httpx.HTTPStatusError:
-        pass
-
-    # If all attempts fail, propagate an error. The caller should catch
-    # httpx.HTTPError and respond with an appropriate message.
-    raise httpx.HTTPError(
-        f"Failed to download file {file_key} in message {message_id}; tried IM resource, IM file, and drive download endpoints"
-    )
-
-# --- Parsing helpers ---
-def _strip_mentions(text: str) -> str:
-    return re.sub(r"<at[^>]*>.*?</at>", "", text or "").strip()
-
-def extract_text_from_file(file_bytes: bytes, file_name: str) -> str:
-    # ... (此函式內容不變) ...
-    name_lower = (file_name or "").lower()
-    try:
-        if (name_lower.endswith(".xlsx") or name_lower.endswith(".xls")) and openpyxl is not None:
-            wb = openpyxl.load_workbook(filename=BytesIO(file_bytes), data_only=True, read_only=True)
-            sheet = wb[wb.sheetnames[0]]
-            lines = []
-            for row in sheet.iter_rows(values_only=True):
-                line = "\t".join("" if c is None else str(c) for c in row)
-                lines.append(line)
-            return "\n".join(lines)
-        if name_lower.endswith(".docx") and docx is not None:
-            d = docx.Document(BytesIO(file_bytes))
-            return "\n".join(p.text for p in d.paragraphs)
-        if (name_lower.endswith(".pptx") or name_lower.endswith(".ppt")) and pptx is not None:
-            prs = pptx.Presentation(BytesIO(file_bytes))
-            out = []
-            for slide in prs.slides:
-                for shape in slide.shapes:
-                    if hasattr(shape, "text"):
-                        out.append(shape.text)
-            return "\n".join(out)
-        if name_lower.endswith(".pdf") and pdfplumber is not None:
-            texts = []
-            with pdfplumber.open(BytesIO(file_bytes)) as pdf:
-                for page in pdf.pages:
-                    t = page.extract_text()
-                    if t:
-                        texts.append(t)
-            return "\n".join(texts) if texts else "[空白 PDF 或無法抽取文字]"
-    except Exception as e:
-        logger.exception("extract_text_from_file error for %s: %s", file_name, e)
-        return f"[解析 {file_name} 發生錯誤: {e}]"
-    return f"[不支援的檔案或缺少解析庫: {file_name}]"
-
-def pdf_page_to_image_bytes(pdf_bytes: bytes) -> Optional[bytes]:
-    """
-    Attempt to convert the first page of a PDF to a PNG image.
-    Returns the PNG bytes if successful, else None.
-    Requires pdfplumber and PIL/Pillow.
-    """
-    if pdfplumber is None or Image is None:
-        return None
-    try:
-        with pdfplumber.open(BytesIO(pdf_bytes)) as pdf:
-            if not pdf.pages:
-                return None
-            page = pdf.pages[0]
-            # The to_image() API returns a PageImage. Use .original to get PIL Image
-            page_img = page.to_image(resolution=150)
-            pil_img = page_img.original
-            buf = BytesIO()
-            pil_img.save(buf, format="PNG")
-            return buf.getvalue()
-    except Exception as e:
-        logger.exception("pdf_page_to_image_bytes error: %s", e)
-        return None
-
-
-def build_image_content(b64_png: str, user_hint: str = "請閱讀此圖片並回覆重點或回答問題。") -> List[dict]:
-    return [
-        {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{b64_png}", "detail": "low"}},
-        {"type": "text", "text": user_hint},
-    ]
-
-# --- OpenAI (using shared client) ---
-async def call_openai_api(messages: List[dict], model: Optional[str] = None) -> dict:
-    if not http_client:
-        raise RuntimeError("HTTP client not initialized.")
-    headers = {"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"}
-    data = {"model": model or OPENAI_MODEL, "messages": messages}
-    r = await http_client.post("https://api.openai.com/v1/chat/completions", headers=headers, json=data)
-    r.raise_for_status()
-    return r.json()
-
-def system_datetime_message() -> dict:
-    return {
-        "role": "system",
-        "content": (
-            "You are SkyGPT. "
-            f"Current local datetime is: {format_datetime_info()}. "
-            "Timezone is Asia/Taipei (UTC+08:00). "
-            "When users ask about the current date/time/day, ALWAYS answer using this clock. "
-            "Do not say you cannot access time."
-        ),
+# ====== Lark 發送文字 ======
+async def send_text_to_chat(chat_id: str, text: str) -> None:
+    tat = await get_tenant_access_token()
+    api = f"{LARK_BASE}/open-apis/im/v1/messages?receive_id_type=chat_id"
+    payload = {
+        "receive_id": chat_id,
+        "content": json.dumps({"text": text}, ensure_ascii=False),
+        "msg_type": "text",
     }
+    headers = {"Authorization": f"Bearer {tat}"}
+    async with httpx.AsyncClient(timeout=20.0) as client:
+        r = await client.post(api, headers=headers, json=payload)
+        if r.status_code >= 400:
+            logger.error("send_text_to_chat failed: %s %s", r.status_code, r.text)
 
-# --- Webhook ---
-@app.post("/webhook")
-async def webhook(request: Request):
-    # ... (此函式內容不變) ...
-    body = await request.body()
+# ====== 正確下載端點（帶 type） ======
+async def download_message_resource(
+    message_id: str,
+    key: str,
+    res_type: str = "file",
+) -> Tuple[bytes, Optional[str], Optional[str]]:
+    """
+    GET /open-apis/im/v1/messages/:message_id/resources/:key?type=file|image
+    回傳 (bytes, filename, content_type)
+    """
+    tat = await get_tenant_access_token()
+    url = f"{LARK_BASE}/open-apis/im/v1/messages/{message_id}/resources/{key}"
+    headers = {"Authorization": f"Bearer {tat}"}
+    params = {"type": res_type}
+    async with httpx.AsyncClient(timeout=60.0) as client:
+        r = await client.get(url, headers=headers, params=params)
+        r.raise_for_status()
+        ct = r.headers.get("Content-Type")
+        disp = r.headers.get("Content-Disposition", "")
+        name = None
+        if "filename=" in disp:
+            try:
+                name = disp.split("filename=", 1)[1].strip('"; ')
+            except Exception:
+                pass
+        return r.content, name, ct
+
+# ====== 聊天訊息列表（用於摘要） ======
+async def list_chat_messages_between(chat_id: str, start_ms: int, end_ms: int, page_size: int = 100) -> List[Dict[str, Any]]:
+    tat = await get_tenant_access_token()
+    headers = {"Authorization": f"Bearer {tat}"}
+    api = f"{LARK_BASE}/open-apis/im/v1/messages"
+    params = {
+        "container_id_type": "chat",
+        "container_id": chat_id,
+        "start_time": str(start_ms),
+        "end_time": str(end_ms),
+        "page_size": str(page_size),
+    }
+    items: List[Dict[str, Any]] = []
+    async with httpx.AsyncClient(timeout=60.0) as client:
+        while True:
+            r = await client.get(api, headers=headers, params=params)
+            r.raise_for_status()
+            data = r.json()
+            page = data.get("data", {}).get("items", []) or []
+            items.extend(page)
+            token = data.get("data", {}).get("page_token")
+            if not token:
+                break
+            params["page_token"] = token
+    return items
+
+# ====== SQLite（訊息存檔與每日鎖） ======
+async def ensure_db():
+    if not aiosqlite:
+        logger.warning("aiosqlite 未安裝，將無法做 per-chat 歷史與鎖。")
+        return
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("""
+        CREATE TABLE IF NOT EXISTS messages(
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            chat_id TEXT,
+            message_id TEXT,
+            sender_id TEXT,
+            ts_ms INTEGER,
+            msg_type TEXT,
+            text TEXT,
+            file_key TEXT,
+            image_key TEXT
+        )""")
+        await db.execute("""
+        CREATE TABLE IF NOT EXISTS summary_lock(
+            summary_date TEXT,
+            chat_id TEXT,
+            PRIMARY KEY(summary_date, chat_id)
+        )""")
+        await db.commit()
+
+async def db_insert_message(row: Dict[str, Any]):
+    if not aiosqlite:
+        return
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("""
+        INSERT INTO messages (chat_id, message_id, sender_id, ts_ms, msg_type, text, file_key, image_key)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)""", (
+            row.get("chat_id"), row.get("message_id"), row.get("sender_id"),
+            row.get("ts_ms"), row.get("msg_type"), row.get("text"),
+            row.get("file_key"), row.get("image_key"),
+        ))
+        await db.commit()
+
+async def acquire_summary_lock(date_str: str, chat_id: str) -> bool:
+    if not aiosqlite:
+        return True
     try:
-        payload = json.loads(body.decode("utf-8"))
+        async with aiosqlite.connect(DB_PATH) as db:
+            await db.execute("INSERT INTO summary_lock (summary_date, chat_id) VALUES (?, ?)", (date_str, chat_id))
+            await db.commit()
+            return True
     except Exception:
-        raise HTTPException(status_code=400, detail="Invalid JSON")
-
-    if "challenge" in payload:
-        return {"challenge": payload["challenge"]}
-
-    header = payload.get("header", {})
-    if header.get("token") != VERIFICATION_TOKEN:
-        raise HTTPException(status_code=403, detail="Invalid token")
-
-    if header.get("event_type") == "im.message.receive_v1":
-        # 使用 asyncio.create_task 讓 webhook 立即回傳，避免 Lark 端超時
-        asyncio.create_task(handle_message_receive(payload.get("event", {})))
-
-    return {"code": 0}
-
-# --- 更穩健的 @ 提及檢測 ---
-def _is_bot_mentioned_in_group(message: dict) -> bool:
-    # ... (此函式內容不變) ...
-    if message.get("chat_type") != "group":
         return False
 
-    mentions = message.get("mentions", []) or []
-    for m in mentions:
-        # Collect all possible id values from the mention (user_id, open_id, app_id, etc.)
-        possible_ids = set()
-        id_info = m.get("id", {})
-        if isinstance(id_info, dict):
-            for v in id_info.values():
-                if isinstance(v, str):
-                    possible_ids.add(v)
-        app_id_top = m.get("app_id")
-        if isinstance(app_id_top, str):
-            possible_ids.add(app_id_top)
-        # Check if this mention matches the bot's known IDs
-        if LARK_APP_ID and LARK_APP_ID in possible_ids:
-            return True
-        # Additionally check if the mention name matches the configured BOT_NAME
-        mention_name = (m.get("name") or "").strip()
-        if BOT_NAME and mention_name.lower() == BOT_NAME.lower():
-            return True
+async def db_list_chat_ids_with_messages_between(start_ms: int, end_ms: int) -> List[str]:
+    if not aiosqlite:
+        return []
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute(
+            "SELECT DISTINCT chat_id FROM messages WHERE ts_ms >= ? AND ts_ms < ?",
+            (start_ms, end_ms)
+        )
+        rows = await cur.fetchall()
+    return [r[0] for r in rows if r and r[0]]
 
-    raw = message.get("content") or "{}"
-    try:
-        c = json.loads(raw)
-        txt = c.get("text", "")
-    except Exception:
-        txt = ""
-    # Check <at> tags for id attributes matching the bot's APP_ID
-    for attr in ("id", "user_id", "open_id", "app_id"):
-        for m in re.finditer(fr'{attr}="([^\"]+)"', txt):
-            if LARK_APP_ID and m.group(1) == LARK_APP_ID:
-                return True
-    # Finally, check for a plain-text @ mention of the bot's name
-    if BOT_NAME:
-        # Use word boundary after the name to avoid partial matches
-        pattern = re.compile(r'@' + re.escape(BOT_NAME) + r'\b', re.IGNORECASE)
-        if pattern.search(txt):
-            return True
-    return False
+# ====== 時間工具 ======
+def now_local() -> datetime:
+    return datetime.now(TZ)
 
-# --- 主訊息處理 ---
-async def handle_message_receive(event: dict):
-    message = event.get("message", {})
-    if not message:
-        return
+def yesterday_range_local() -> Tuple[datetime, datetime]:
+    today = now_local().date()
+    y = today - timedelta(days=1)
+    start = datetime(y.year, y.month, y.day, 0, 0, 0, tzinfo=TZ)
+    end = start + timedelta(days=1)
+    return start, end
 
-    logger.info("Received message payload: %s", json.dumps(message))
+def to_epoch_ms(dt: datetime) -> int:
+    return int(dt.timestamp() * 1000)
 
-    chat_type = message.get("chat_type")
-    chat_id = message.get("chat_id")
-    message_id = message.get("message_id")
+# ====== 內容解析 ======
+def parse_msg_item_basic(item: Dict[str, Any]) -> Dict[str, Any]:
+    msg = item.get("message") or item
+    message_id = msg.get("message_id") or ""
+    chat_id = msg.get("chat_id") or item.get("chat_id")
+    msg_type = msg.get("message_type") or msg.get("msg_type")
+    sender = msg.get("sender") or {}
+    sender_id = sender.get("sender_id") or sender.get("open_id") or ""
 
-    create_time_ms = message.get("create_time")
-    ts_local = datetime.fromtimestamp(int(create_time_ms) / 1000, tz=timezone.utc).astimezone(timezone(timedelta(hours=TIMEZONE_OFFSET))) if create_time_ms else now_local()
-
-    msg_type = message.get("message_type")
-    content = json.loads(message.get("content") or "{}")
-
-    # 記錄到 SQLite
-    summary_text = ""
-    if msg_type == "text":
-        summary_text = _strip_mentions(content.get("text", ""))
-    elif msg_type == "image":
-        summary_text = "[圖片]"
-    elif msg_type == "file":
-        summary_text = f"[檔案: {content.get('file_name') or ''}]"
-    if all([message_id, chat_id, chat_type, summary_text]):
-        await log_message_to_db(message_id, chat_id, chat_type, ts_local, summary_text)
-
-    # 更新媒體快取：記錄該聊天室最近的圖片或檔案。
-    # 我們僅透過 chat_id 做快取，避免 sender 比對錯誤；TTL 控制有效期。
-    try:
-        if msg_type == "image":
-            image_key = content.get("image_key")
-            if image_key:
-                LAST_MEDIA_CACHE[chat_id] = {
-                    "type": "image",
-                    "key": image_key,
-                    "message_id": message_id,
-                    "timestamp": ts_local,
-                }
-        elif msg_type == "file":
-            file_key = content.get("file_key")
-            file_name = content.get("file_name") or ""
-            if file_key:
-                LAST_MEDIA_CACHE[chat_id] = {
-                    "type": "file",
-                    "key": file_key,
-                    "name": file_name,
-                    "message_id": message_id,
-                    "timestamp": ts_local,
-                }
-        # 如果是文字消息，但其中包含 image_key 或 file_key，表示這可能是引用（reply）或嵌入的媒體。
-        elif msg_type == "text":
-            # Some reply messages embed the media key directly in the content (e.g., quoted messages).
-            embedded_image_key = content.get("image_key")
-            embedded_file_key = content.get("file_key")
-            if embedded_image_key:
-                # 優先將這當作圖片訊息快取
-                LAST_MEDIA_CACHE[chat_id] = {
-                    "type": "image",
-                    "key": embedded_image_key,
-                    "message_id": message_id,
-                    "timestamp": ts_local,
-                }
-            elif embedded_file_key:
-                LAST_MEDIA_CACHE[chat_id] = {
-                    "type": "file",
-                    "key": embedded_file_key,
-                    "name": content.get("file_name") or "",
-                    "message_id": message_id,
-                    "timestamp": ts_local,
-                }
-    except Exception as e:
-        logger.exception("Error updating media cache: %s", e)
-
-    # 觸發條件
-    is_trigger = (chat_type == "p2p") or (chat_type == "group" and _is_bot_mentioned_in_group(message))
-    if not is_trigger:
-        logger.info("Ignored message (no @mention in group or not P2P).")
-        return
-
-    # 處理時間問題
-    user_text_for_dt = _strip_mentions(content.get("text", "")).lower() if msg_type == "text" else ""
-    dt_patterns = [r"今天|日期|幾號|現在幾點|現在時間|現在|時間|幾點|星期幾|禮拜幾", r"\b(date|today|time|current)\b"]
-    if user_text_for_dt and any(re.search(p, user_text_for_dt) for p in dt_patterns):
-        await send_message_to_lark(chat_id, f"現在時間：{format_datetime_info()}")
-        return
-
-    # 其餘分流處理
-    try:
-        reply = ""
-        if msg_type == "image":
-            image_key = content.get("image_key")
-            if not image_key:
-                await send_message_to_lark(chat_id, "收到圖片但缺少 image_key。")
-                return
-            try:
-                file_bytes = await download_image(image_key)
-            except Exception as e:
-                logger.exception("Failed to download image %s: %s", image_key, e)
-                await send_message_to_lark(chat_id, "抱歉，無法下載圖片內容。請確認機器人權限或稍後再試。")
-                return
-            b64 = base64.b64encode(file_bytes).decode("utf-8")
-            mm = [system_datetime_message(), {"role": "user", "content": build_image_content(b64)}]
-            resp = await call_openai_api(mm)
-            reply = resp["choices"][0]["message"]["content"].strip()
-
-        elif msg_type == "file":
-            file_key = content.get("file_key")
-            file_name = content.get("file_name") or "附件"
-            # If no file_key exists, this is likely a cloud link or external share. Inform user.
-            if not file_key:
-                await send_message_to_lark(
-                    chat_id,
-                    (
-                        "抱歉，這個檔案似乎是雲端連結或外部分享，機器人無法直接下載。"
-                        "請確認已為機器人開啟適當的檔案存取權限，或先下載後再以附件形式上傳。"
-                    ),
-                )
-                return
-            try:
-                file_bytes = await download_file(message_id, file_key)
-            except Exception as e:
-                logger.exception("Failed to download file %s: %s", file_key, e)
-                await send_message_to_lark(
-                    chat_id,
-                    (
-                        "抱歉，我無法直接訪問或下載此檔案的內容。這類雲端連結或共享檔案需要"
-                        "適當權限，請確認機器人已獲得檔案存取權，或將檔案下載後以附件形式重新上傳。"
-                    ),
-                )
-                return
-            # Try to extract text from the file. If extraction fails for PDF, attempt image conversion.
-            extracted = extract_text_from_file(file_bytes, file_name)
-            if file_name.lower().endswith(".pdf"):
-                # If extraction result suggests unsupported or blank PDF, try converting first page to image
-                if extracted.startswith("["):
-                    img_bytes = pdf_page_to_image_bytes(file_bytes)
-                    if img_bytes:
-                        try:
-                            b64 = base64.b64encode(img_bytes).decode("utf-8")
-                            mm = [system_datetime_message(), {"role": "user", "content": build_image_content(b64, "請閱讀此文件第一頁並摘要重點。")}]
-                            resp = await call_openai_api(mm)
-                            reply = resp["choices"][0]["message"]["content"].strip()
-                            await send_message_to_lark(chat_id, reply)
-                            return
-                        except Exception as e:
-                            logger.exception("Failed to process PDF via image: %s", e)
-                            # fall back to text summarization below
-            # For all files (including PDFs if extraction succeeded or image fallback failed), send text summary
-            prompt = f"請閱讀以下檔案內容，使用繁體中文摘要重點：\n\n{extracted[:15000]}"
-            mm = [system_datetime_message(), {"role": "user", "content": prompt}]
-            resp = await call_openai_api(mm)
-            reply = resp["choices"][0]["message"]["content"].strip()
-
-        elif msg_type == "text":
-            user_text = _strip_mentions(content.get("text", ""))
-            if not user_text:
-                await send_message_to_lark(chat_id, "（空白訊息）")
-                return
-            # 檢查最近快取的圖片/檔案，若在有效時間內則附帶處理
-            last_media = LAST_MEDIA_CACHE.get(chat_id)
-            mm = [system_datetime_message()]
-            attached = False
-            if last_media:
-                try:
-                    age = (ts_local - last_media.get("timestamp", ts_local)).total_seconds()
-                    if age <= MEDIA_CACHE_TTL:
-                        media_type = last_media.get("type")
-                        if media_type == "image":
-                            # 讀取並附上上一張圖片內容（使用專用圖片端點）
-                            try:
-                                file_bytes = await download_image(last_media["key"])
-                                b64 = base64.b64encode(file_bytes).decode("utf-8")
-                                mm.append({"role": "user", "content": build_image_content(b64)})
-                                attached = True
-                            except Exception as e:
-                                logger.exception("Failed to fetch cached image: %s", e)
-                                LAST_MEDIA_CACHE.pop(chat_id, None)
-                        elif media_type == "file":
-                            # 讀取並附上上一個檔案內容（非圖片）
-                            try:
-                                file_bytes = await download_file(last_media["message_id"], last_media["key"])
-                                file_name = last_media.get("name") or ""
-                                extracted = extract_text_from_file(file_bytes, file_name)
-                                # If this is a PDF and extraction fails, attempt to convert first page to image
-                                if file_name.lower().endswith(".pdf") and extracted.startswith("["):
-                                    img_bytes = pdf_page_to_image_bytes(file_bytes)
-                                    if img_bytes:
-                                        b64 = base64.b64encode(img_bytes).decode("utf-8")
-                                        mm.append({"role": "user", "content": build_image_content(b64, "請閱讀此文件第一頁並摘要重點。")})
-                                        attached = True
-                                    else:
-                                        # fallback to extracted text (error message) below
-                                        mm.append({"role": "user", "content": f"以下是近期附件內容：\n{extracted[:15000]}"})
-                                        attached = True
-                                else:
-                                    mm.append({"role": "user", "content": f"以下是近期附件內容：\n{extracted[:15000]}"})
-                                    attached = True
-                            except Exception as e:
-                                logger.exception("Failed to fetch cached file: %s", e)
-                                LAST_MEDIA_CACHE.pop(chat_id, None)
-                except Exception as e:
-                    logger.exception("Failed to fetch cached media: %s", e)
-                    # 移除快取以避免下次重複失敗
-                    LAST_MEDIA_CACHE.pop(chat_id, None)
-            # 最後加入使用者的問題文字
-            mm.append({"role": "user", "content": user_text})
-            resp = await call_openai_api(mm)
-            reply = resp["choices"][0]["message"]["content"].strip()
-        else:
-            await send_message_to_lark(chat_id, "這個訊息類型暫不支援，請傳文字、圖片或檔案。")
-            return
-        
-        if reply:
-            await send_message_to_lark(chat_id, reply)
-
-    except Exception as e:
-        logger.exception("Error handling message: %s", e)
-        await send_message_to_lark(chat_id, f"抱歉，處理訊息時發生錯誤：{e}")
-
-
-# --- [OPTIMIZED] 每日 08:00 摘要 (邏輯更穩健) ---
-async def daily_summary_scheduler():
-    """
-    Background task that runs once per day at 08:00 local time (as determined by
-    TIMEZONE_OFFSET) and summarizes the previous day's group chats.  This
-    implementation avoids subtle bugs with timezone-aware datetimes by
-    constructing the next run time via datetime.combine(), rather than
-    using .replace() on a potentially timezone-aware datetime.  It also
-    computes the previous day's start and end boundaries using explicit date
-    arithmetic.
-    """
-    while True:
+    ts_ms = 0
+    if "create_time" in msg:
         try:
-            now_dt = now_local()
-            # Compute the next run time at 08:00 local time.  Using datetime.combine
-            # avoids issues where .replace() may produce unexpected results on
-            # timezone-aware datetimes.
-            today = now_dt.date()
-            # Use the standalone time class imported from datetime instead of
-            # datetime.time(), which is a descriptor on the datetime.datetime class
-            next_run = datetime.combine(today, time(8, 0), tzinfo=now_dt.tzinfo)
-            if now_dt >= next_run:
-                next_run += timedelta(days=1)
-            wait_seconds = (next_run - now_dt).total_seconds()
-            logger.info(
-                "Scheduler: Next summary run at %s (in %.2f hours)",
-                next_run,
-                wait_seconds / 3600,
-            )
-            await asyncio.sleep(wait_seconds)
+            ts_ms = int(msg["create_time"])
+        except Exception:
+            pass
 
-            # At the scheduled time, compute the date range for the previous day.
-            run_time = now_local()
-            yesterday = (run_time - timedelta(days=1)).date()
-            day_start = datetime.combine(yesterday, time(0, 0), tzinfo=run_time.tzinfo)
-            day_end = datetime.combine(
-                yesterday,
-                time(23, 59, 59, 999999),
-                tzinfo=run_time.tzinfo,
-            )
+    content_str = msg.get("content") or "{}"
+    try:
+        content = json.loads(content_str)
+    except Exception:
+        content = {}
 
-            chats_to_summarize = await get_chats_for_summary(day_start, day_end)
-            if not chats_to_summarize:
-                logger.info(
-                    "No new group chats to summarize for %s.",
-                    day_start.strftime('%Y-%m-%d'),
-                )
-                continue
+    text = None; file_key = None; image_key = None
+    if msg_type == "text":
+        text = content.get("text")
+    elif msg_type == "post":
+        text = re.sub(r"<.*?>", "", content_str)
+    elif msg_type == "file":
+        file_key = content.get("file_key")
+        text = content.get("file_name")
+    elif msg_type == "image":
+        image_key = content.get("image_key")
+    else:
+        text = content_str
 
-            for chat_id, messages in chats_to_summarize.items():
-                # Skip empty message lists
-                if not messages:
-                    continue
+    return {
+        "chat_id": chat_id, "message_id": message_id, "msg_type": msg_type,
+        "sender_id": sender_id, "ts_ms": ts_ms, "text": text,
+        "file_key": file_key, "image_key": image_key, "raw": msg,
+    }
 
-                # Acquire a summary lock for this chat and date.  If the lock
-                # already exists (i.e. another worker/process has already
-                # summarized this chat), skip to avoid duplicate summaries.
-                lock_acquired = await acquire_summary_lock(chat_id, day_start.strftime('%Y-%m-%d'))
-                if not lock_acquired:
-                    logger.info(
-                        "Summary for chat_id %s on %s already generated by another process. Skipping.",
-                        chat_id,
-                        day_start.strftime('%Y-%m-%d'),
-                    )
-                    continue
+# ====== 檔案與圖片解析 ======
+def guess_filename(default_name: str, content_type: Optional[str], header_name: Optional[str]) -> str:
+    if header_name:
+        return header_name
+    if content_type:
+        ext = mimetypes.guess_extension(content_type.split(";")[0].strip()) or ""
+        if ext and not default_name.endswith(ext):
+            return default_name + ext
+    return default_name
 
-                # Build the content string of messages for summarization.  Each line
-                # includes the time (HH:MM) and the message text.  To limit the
-                # payload size, truncate after 15k characters.
-                content_lines = [
-                    f"{m['timestamp'].strftime('%H:%M')}: {m['text']}" for m in messages
-                ]
-                combined = "\n".join(content_lines)
+def safe_decode_text(data: bytes) -> str:
+    for enc in ("utf-8", "utf-16", "big5", "gbk", "latin1"):
+        try:
+            return data.decode(enc)
+        except Exception:
+            continue
+    return data.decode("utf-8", errors="ignore")
 
-                # Instruct the AI to produce a structured summary with sections for
-                # key decisions, action items and open issues.  We prepend
-                # instructions and example headings to guide the model.  The
-                # actual date and headings will be added when sending the message.
-                prompt = (
-                    "請將以下群組聊天記錄整理成摘要，使用繁體中文，並依照下列格式輸出：\n"
-                    "#### 關鍵決策\n- ...\n"
-                    "#### 待辦事項\n- ...\n"
-                    "#### 未決問題\n- ...\n"
-                    "以下是聊天記錄：\n\n"
-                    + combined[:15000]
-                )
-                try:
-                    resp = await call_openai_api(
-                        [system_datetime_message(), {"role": "user", "content": prompt}]
-                    )
-                    summary = resp["choices"][0]["message"]["content"].strip()
-                    # Construct final message with date and top-level heading
-                    date_str = day_start.strftime('%Y-%m-%d')
-                    final_summary = (
-                        f"({date_str}):\n"
-                        "### 群組聊天記錄摘要\n"
-                        f"{summary}"
-                    )
-                    await send_message_to_lark(chat_id, final_summary)
-                    # 成功發送摘要後，才標記這個聊天室的訊息為已處理
-                    await mark_chat_messages_as_summarized(chat_id, day_start, day_end)
-                except Exception as e:
-                    logger.exception(
-                        "Summary generation/sending failed for chat_id %s. Will retry next cycle. Error: %s",
-                        chat_id,
-                        e,
-                    )
-                    # 失敗後不標記，以便下次重試
+def extract_text_from_pdf(data: bytes) -> str:
+    if not HAVE_PYPDF:
+        return "[PDF 已接收，但伺服器未安裝 pypdf]"
+    try:
+        reader = PdfReader(io.BytesIO(data))
+        parts = []
+        for page in reader.pages[:20]:
+            try:
+                parts.append(page.extract_text() or "")
+            except Exception:
+                pass
+        text = "\n".join(parts).strip()
+        return text or "[PDF 無可抽取文字]"
+    except Exception:
+        return "[PDF 解析失敗]"
+
+def extract_text_from_docx(data: bytes) -> str:
+    if not HAVE_DOCX:
+        return "[DOCX 已接收，但伺服器未安裝 docx2txt]"
+    try:
+        import tempfile, os as _os
+        with tempfile.TemporaryDirectory() as td:
+            p = _os.path.join(td, "tmp.docx")
+            with open(p, "wb") as f:
+                f.write(data)
+            text = docx2txt.process(p) or ""
+            return text.strip() or "[DOCX 無可抽取文字]"
+    except Exception:
+        return "[DOCX 解析失敗]"
+
+def extract_text_generic(data: bytes, filename: str, content_type: Optional[str]) -> str:
+    name = filename.lower()
+    if name.endswith(".pdf") or (content_type and "pdf" in content_type):
+        return extract_text_from_pdf(data)
+    if name.endswith(".docx") or (content_type and "officedocument.wordprocessingml" in content_type):
+        return extract_text_from_docx(data)
+    if name.endswith(".csv") or (content_type and "csv" in content_type):
+        try:
+            return "\n".join(safe_decode_text(data).splitlines()[:50])
+        except Exception:
+            return "[CSV 解析失敗]"
+    if name.endswith(".txt") or (content_type and "text/plain" in content_type):
+        return safe_decode_text(data)
+    try:
+        return safe_decode_text(data)
+    except Exception:
+        return f"[{filename}（{len(data)} bytes）]"
+
+# ====== OpenAI 幫助 ======
+async def openai_text_completion(prompt: str, sys: str = "You are a helpful assistant.") -> str:
+    if not USE_OPENAI:
+        return prompt[:8000]
+    try:
+        resp = oai_client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[{"role": "system", "content": sys}, {"role": "user", "content": prompt}],
+            temperature=0.2,
+        )
+        return resp.choices[0].message.content.strip()
+    except Exception:
+        return prompt[:8000]
+
+async def openai_vision_describe(image_bytes: bytes, extra_prompt: str = "") -> str:
+    if not USE_OPENAI:
+        return "[已接收圖片]"
+    try:
+        b64 = base64.b64encode(image_bytes).decode("utf-8")
+        messages = [
+            {"role": "system", "content": "You are an expert image analyst."},
+            {"role": "user", "content": [
+                {"type": "text", "text": extra_prompt or "請描述這張圖片的重點。"},
+                {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{b64}"}},
+            ]}
+        ]
+        resp = oai_client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=messages,
+            temperature=0.2,
+        )
+        return resp.choices[0].message.content.strip()
+    except Exception:
+        return "[圖片解析失敗]"
+
+# ====== 摘要 ======
+SUMMARY_PROMPT = """你是資深會議/群組助理。請將下列聊天訊息整理成摘要（繁體中文）：
+輸出格式：
+(YYYY-MM-DD):
+### 群組聊天記錄摘要
+
+#### 關鍵決策
+- ...
+
+#### 待辦事項
+- ...
+
+#### 未決問題
+- ...
+
+僅總結「昨天（本地時區）」00:00–24:00 的內容，簡潔具體。"""
+
+def render_yesterday_title(dt: datetime) -> str:
+    y = dt.date() - timedelta(days=1)
+    return f"({y.isoformat()}):"
+
+async def summarize_messages_text(snippets: List[str]) -> str:
+    text = "\n".join(f"- {s}" for s in snippets)
+    if USE_OPENAI:
+        prompt = f"{SUMMARY_PROMPT}\n\n---\n聊天摘錄：\n{text[:12000]}"
+        return await openai_text_completion(prompt)
+    return f"""{render_yesterday_title(now_local())}
+### 群組聊天記錄摘要
+
+#### 關鍵決策
+- （未配置 OpenAI；共 {len(snippets)} 則訊息）
+
+#### 待辦事項
+- 依訊息整理行動項
+
+#### 未決問題
+- （如有）"""
+
+# ====== Webhook 入口 ======
+@app.post("/webhook")
+async def webhook_alias(request: Request):
+    return await lark_event(request)
+
+@app.post("/webhook/lark")
+async def lark_event(request: Request):
+    body = await request.json()
+    if "challenge" in body:
+        return JSONResponse({"challenge": body["challenge"]})
+    event = body.get("event", {}) or {}
+    header = body.get("header", {}) or {}
+    etype = header.get("event_type") or event.get("type")
+    if etype and "message" in etype:
+        await handle_message_event(event)
+    return JSONResponse({"code": 0})
+
+# ====== 訊息處理 ======
+async def handle_message_event(event: Dict[str, Any]):
+    msg = event.get("message") or {}
+    chat_id = msg.get("chat_id")
+    message_id = msg.get("message_id")
+    msg_type = msg.get("message_type")
+    sender = event.get("sender", {}) or {}
+    sender_open_id = (sender.get("sender_id") or {}).get("open_id") or ""
+    create_ms = 0
+    try:
+        create_ms = int(msg.get("create_time") or "0")
+    except Exception:
+        pass
+
+    content_str = msg.get("content") or "{}"
+    try:
+        content = json.loads(content_str)
+    except Exception:
+        content = {}
+
+    # 入庫
+    try:
+        await db_insert_message({
+            "chat_id": chat_id,
+            "message_id": message_id,
+            "sender_id": sender_open_id,
+            "ts_ms": create_ms,
+            "msg_type": msg_type,
+            "text": content.get("text") if msg_type == "text" else None,
+            "file_key": content.get("file_key") if msg_type == "file" else None,
+            "image_key": content.get("image_key") if msg_type == "image" else None,
+        })
+    except Exception as e:
+        logger.debug("db insert skipped: %s", e)
+
+    # 指令與一般應答
+    if msg_type == "text":
+        text = (content.get("text") or "").strip()
+        if not text:
+            return
+        if text.startswith("/help"):
+            await send_text_to_chat(chat_id,
+                "指令：\n"
+                "/time 現在時間\n"
+                "/date 今日日期\n"
+                "/summary 立即彙整昨天摘要（只對本群）\n"
+                "(或直接提問)")
+            return
+        if text.startswith("/time"):
+            await send_text_to_chat(chat_id, now_local().strftime("現在時間：%Y-%m-%d %H:%M:%S %Z"))
+            return
+        if text.startswith("/date"):
+            await send_text_to_chat(chat_id, now_local().strftime("今日日期：%Y-%m-%d（%A）"))
+            return
+        if text.startswith("/summary"):
+            await summarize_for_single_chat(chat_id)
+            return
+        if USE_OPENAI:
+            prompt = f"現在本地時間是 {now_local().strftime('%Y-%m-%d %H:%M:%S %Z')}。\n使用繁體中文回答：\n\n使用者：{text}"
+            out = await openai_text_completion(prompt, sys="You are a helpful assistant in Traditional Chinese.")
+            await send_text_to_chat(chat_id, out)
+        else:
+            await send_text_to_chat(chat_id, f"(無 LLM) 你說：{text}\n現在：{now_local().strftime('%Y-%m-%d %H:%M:%S %Z')}")
+        return
+
+    if msg_type == "image":
+        image_key = content.get("image_key")
+        if not image_key:
+            await send_text_to_chat(chat_id, "收到圖片，但缺少 image_key。")
+            return
+        try:
+            img_bytes, _, _ = await download_message_resource(message_id, image_key, "image")
+            desc = await openai_vision_describe(img_bytes)
+            await send_text_to_chat(chat_id, desc)
         except Exception as e:
-            logger.exception("daily_summary_scheduler error: %s", e)
-            # 發生重大錯誤時，等待 1 分鐘後重試
-            await asyncio.sleep(60)
+            logger.exception("image fail: %s", e)
+            await send_text_to_chat(chat_id, "圖片下載/解析失敗，請稍後再試。")
+        return
 
-# --- FastAPI 生命週期事件 ---
+    if msg_type == "file":
+        file_key = content.get("file_key")
+        file_name = content.get("file_name") or "file"
+        if not file_key:
+            await send_text_to_chat(chat_id, "收到檔案，但缺少 file_key。")
+            return
+        try:
+            data, header_name, content_type = await download_message_resource(message_id, file_key, "file")
+            fname = guess_filename(file_name, content_type, header_name)
+            text = extract_text_generic(data, fname, content_type)
+            if USE_OPENAI:
+                prompt = f"以下是使用者上傳文件「{fname}」的內容摘錄，請以繁體中文摘要重點與待辦：\n\n{text[:12000]}"
+                out = await openai_text_completion(prompt)
+            else:
+                out = f"(無 LLM)\n檔名：{fname}\n前 400 字：\n{text[:400]}"
+            await send_text_to_chat(chat_id, out)
+        except Exception as e:
+            logger.exception("file fail: %s", e)
+            await send_text_to_chat(chat_id, "檔案下載/解析失敗，請稍後再試。")
+        return
+
+# ====== 每日摘要：逐群處理 ======
+def _yesterday_title() -> str:
+    y = now_local().date() - timedelta(days=1)
+    return f"({y.isoformat()}):"
+
+async def summarize_for_single_chat(chat_id: str):
+    start_dt, end_dt = yesterday_range_local()
+    start_ms, end_ms = to_epoch_ms(start_dt), to_epoch_ms(end_dt)
+    date_tag = (start_dt.date()).isoformat()
+    if not await acquire_summary_lock(date_tag, chat_id):
+        return
+    try:
+        items = await list_chat_messages_between(chat_id, start_ms, end_ms)
+    except Exception as e:
+        logger.warning("list by API failed, fallback DB: %s", e)
+        items = []
+    snippets: List[str] = []
+    if items:
+        for it in items:
+            meta = parse_msg_item_basic(it)
+            if meta["msg_type"] == "text" and meta.get("text"):
+                clean = re.sub(r"<.*?>", "", meta["text"]).strip()
+                if clean:
+                    snippets.append(clean[:300])
+    elif aiosqlite:
+        async with aiosqlite.connect(DB_PATH) as db:
+            cur = await db.execute(
+                "SELECT text FROM messages WHERE chat_id=? AND ts_ms >= ? AND ts_ms < ? AND msg_type='text'",
+                (chat_id, start_ms, end_ms)
+            )
+            rows = await cur.fetchall()
+        for (t,) in rows:
+            if t:
+                clean = re.sub(r"<.*?>", "", t).strip()
+                if clean:
+                    snippets.append(clean[:300])
+    if not snippets:
+        await send_text_to_chat(chat_id, f"{_yesterday_title()}\n（昨天沒有可摘要的文字訊息）")
+        return
+    summary = await summarize_messages_text(snippets)
+    await send_text_to_chat(chat_id, summary)
+
+async def run_daily_summary_per_chat():
+    start_dt, end_dt = yesterday_range_local()
+    start_ms, end_ms = to_epoch_ms(start_dt), to_epoch_ms(end_dt)
+    if not aiosqlite:
+        logger.warning("aiosqlite 不可用，無法自動列出群組；跳過每日摘要。")
+        return
+    chat_ids = await db_list_chat_ids_with_messages_between(start_ms, end_ms)
+    if not chat_ids:
+        logger.info("昨天沒有發現有聊天的群組，略過摘要。")
+        return
+    for cid in chat_ids:
+        try:
+            await summarize_for_single_chat(cid)
+        except Exception as e:
+            logger.exception("summary for chat %s failed: %s", cid, e)
+
+# ====== APScheduler（每天 08:00） ======
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from apscheduler.triggers.cron import CronTrigger
+
+scheduler: Optional[AsyncIOScheduler] = None
+
+def start_scheduler():
+    global scheduler
+    if scheduler:
+        return
+    scheduler = AsyncIOScheduler(timezone=TZ)
+    scheduler.add_job(
+        lambda: asyncio.create_task(run_daily_summary_per_chat()),
+        CronTrigger(hour=8, minute=0, second=0, timezone=TZ),
+        id="daily_summary_0800_per_chat",
+        max_instances=1,
+        coalesce=True,
+        misfire_grace_time=300,
+    )
+    scheduler.start()
+    logger.info("Scheduler started (08:00 %s)", TIMEZONE)
+
+# ====== 健康檢查 ======
+@app.get("/")
+async def root_ok():
+    return PlainTextResponse("ok")
+
+@app.get("/healthz")
+async def healthz():
+    return JSONResponse({
+        "status": "ok",
+        "now": now_local().strftime("%Y-%m-%d %H:%M:%S %Z"),
+        "tz": TIMEZONE,
+        "openai": bool(USE_OPENAI),
+    })
+
+# ====== 啟動 ======
 @app.on_event("startup")
-async def startup_event():
-    """應用啟動時執行的事件"""
-    global http_client
-    http_client = httpx.AsyncClient(timeout=60) # 建立共用的 client
-    await init_db() # 初始化資料庫
-    asyncio.create_task(daily_summary_scheduler()) # 啟動背景排程
+async def on_startup():
+    if not APP_ID or not APP_SECRET:
+        logger.warning("APP_ID/APP_SECRET 未設定，Lark API 將無法運作。")
+    if aiosqlite:
+        await ensure_db()
+    else:
+        logger.warning("未安裝 aiosqlite，per-chat 摘要將無法運作。")
+    start_scheduler()
+    logger.info("SkyGPT ready.")
 
-@app.on_event("shutdown")
-async def shutdown_event():
-    """應用關閉時執行的事件"""
-    if http_client:
-        await http_client.aclose() # 優雅地關閉 client
-
-# --- Web server entry (local run) ---
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", "8080")))
+    uvicorn.run("main:app", host="0.0.0.0", port=int(os.getenv("PORT", "8080")))
