@@ -283,6 +283,12 @@ async def download_file(message_id: str, file_key: str) -> bytes:
         raise RuntimeError("HTTP client not initialized.")
     token = await get_lark_token()
     headers = {"Authorization": f"Bearer {token}"}
+        # Use messages/{message_id}/resources/{file_key} endpoint exclusively
+    url = f"https://open.larksuite.com/open-apis/im/v1/messages/{message_id}/resources/{file_key}"
+    r = await http_client.get(url, headers=headers)
+    r.raise_for_status()
+    return r.content
+
     # First try the generic resource endpoint (works for most file types). Some
     # file attachments may not be accessible via this endpoint, resulting in
     # 400/403/404 errors. In such cases, we fall back to the dedicated file
